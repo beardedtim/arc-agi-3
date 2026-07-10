@@ -1251,9 +1251,9 @@ Three run-defining constraints, all from tickets/0009:
 # below is the real measurement).
 uv run python train.py \
   --config.output-dir runs/held_out_v1 \
-  --config.train-games '["ar25","bp35","cn04","dc22","g50t","ka59","lf52","lp85","ls20","m0r0","re86","s5i5","sb26","sc25","sp80","su15","tn36","tr87","tu93","vc33"]' \
+  --config.train-games ar25 bp35 cn04 dc22 g50t ka59 lf52 lp85 ls20 m0r0 re86 s5i5 sb26 sc25 sp80 su15 tn36 tr87 tu93 vc33 \
   --config.eval-every 10000 \
-  --config.eval-games '["cd82","r11l","ft09","sk48","wa30"]' \
+  --config.eval-games cd82 r11l ft09 sk48 wa30 \
   --config.eval-episodes-per-game 1
 
 # After the run: the full pre-registered protocol, all 25 games, both modes.

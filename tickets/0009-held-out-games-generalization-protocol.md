@@ -170,9 +170,9 @@ The generalization run's TRAINING_LOG entry should pre-register at least:
 # round-robin, periodic zero-shot eval on the 5 held-out games.
 uv run python train.py \
   --config.output-dir runs/held_out_v1 \
-  --config.train-games '["ar25","bp35","cn04","dc22","g50t","ka59","lf52","lp85","ls20","m0r0","re86","s5i5","sb26","sc25","sp80","su15","tn36","tr87","tu93","vc33"]' \
+  --config.train-games ar25 bp35 cn04 dc22 g50t ka59 lf52 lp85 ls20 m0r0 re86 s5i5 sb26 sc25 sp80 su15 tn36 tr87 tu93 vc33 \
   --config.eval-every 10000 \
-  --config.eval-games '["cd82","r11l","ft09","sk48","wa30"]' \
+  --config.eval-games cd82 r11l ft09 sk48 wa30 \
   --config.eval-episodes-per-game 1
 ```
 
