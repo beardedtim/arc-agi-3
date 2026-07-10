@@ -51,19 +51,45 @@ I think the following is a valid approach to solving this problem:
 
 ## Current Progress
 
-- [ ] Training Basic World Model: _**In Progress**_
-  - I think it's important to have _some level_ of World Model
-    validated and trained before we integrate another piece that
-    depends on it, even if they need to be trained together from
-    scratch
+See `tickets/` for the design history and `TRAINING_LOG.md` for every run's
+pre-registered expectations and findings.
 
-- [ ] Exploration: _**Scoping**_
-  - There needs to be some way for when Thumper is _planning_ that he _wants_
-    to explore, knowing that he's going to fail a few times before he's really
-    going to be able to have a solid plan.
+- [x] Training Basic World Model: _**Done, validated**_ (tickets 0001, 0004)
+  - Dreamer-style world model (`model/world_model.py`): symbol-embedding conv
+    encoder → RSSM → decoder + reward/continue/internal-state heads, trained
+    online across all 25 downloaded games at once (`train.py`).
+  - Run 3 validated it end-to-end: imagination holds over the full dream
+    horizon (after the ticket 0004 burn-in fix — the earlier per-step
+    macro-context design collapsed imagination, Run 2), and the reward head
+    nails scoring transitions (±1.0→±1.1) despite them being ~0.015% of steps.
 
-- [ ] Memory: _**Scoping**_
-  - Thumper needs a way to "remember" things. LSTM/GRU/Transformer/idk. This should
-    probably be a part of his World Model _and_ his Planning stage.
-    - I use my memory to decide what _type of state_ I am in
-    - I use my memory to decide how to get to my _future state_
+- [x] Memory: _**Done**_ (ticket 0002)
+  - Hierarchical slow-fast split: the RSSM's GRU is the fast frame-to-frame
+    memory; a `TaskEncoder` (`model/task_encoder.py`) folds completed
+    transitions into a slow macro-context vector `m` — Thumper's evolving
+    belief about the current game's rules — which conditions the RSSM
+    prior/posterior and the exploration ensemble.
+  - `m` is built over a burn-in prefix and frozen for the loss window /
+    dream rollout (ticket 0004), so training and imagination see the same
+    kind of context. Known gap: online play accumulates `m` over a whole
+    episode, longer than training's burn-in horizon.
+
+- [x] Exploration: _**Done, driving play**_ (ticket 0003)
+  - Plan2Explore-style transition ensemble; its disagreement is the intrinsic
+    reward stream for an actor-critic trained entirely in imagination
+    (`Thumper.dream` + `training/actor_critic.py`). Intrinsic-driven play
+    found the first real scoring episodes (Run 5).
+
+- [ ] Planner (actor-critic) actually scoring: _**In Progress**_
+    (tickets 0005, 0006 — Run 6 in flight)
+  - Ticket 0005 split extrinsic and intrinsic returns into two streams
+    (separate critics, separate return normalizers) after Run 3 showed the
+    intrinsic stream drowning score by construction; also fixed
+    truncation-vs-termination and added reward-stratified replay sampling.
+  - Run 5 exposed reward farming: in dreams the policy learned to re-trigger
+    the reward head repeatedly for a level completion that pays once. Ticket
+    0006 makes extrinsic returns absorbing at predicted scores; Run 6
+    (resuming `runs/two_stream_returns`) is validating that the farming
+    incentive is gone and scoring recurs in real play.
+
+- [ ] Train during execution: _**Not started**_ — still the future goal.
