@@ -10,7 +10,8 @@ import torch
 
 from env.env import StepResult
 from model.actions import RESET
-from tests.conftest import GRID, small_config
+from model.rssm import RSSM
+from tests.conftest import GRID, STACK, small_config
 from training.evaluate import EvalProtocol, EvalReport, evaluate
 from training.online_actor import OnlineActor
 from training.trainer import Trainer, TrainerConfig
@@ -63,80 +64,110 @@ class ScriptedEnv:
 
 
 class TestOnlineActorRefactorEquivalence:
-    def test_matches_inline_pre_refactor_logic(self, tmp_path):
-        """Drive OnlineActor and a hand-rolled copy of the pre-refactor
-        Trainer._begin_episode/_act/_step_latent logic side by side against
-        the same thumper + scripted frames; both must pick identical
-        actions given identical RNG seeding, since OnlineActor's act() must
-        be bit-for-bit the old inline sequence (encode -> observe_step -> act)."""
+    def test_matches_forward_sequence_ground_truth(self, tmp_path, monkeypatch):
+        """OnlineActor's TaskEncoder folds must align with
+        WorldModel.forward_sequence's arrival-state convention exactly
+        (tickets/0008): fold k's (deter, action, reward) inputs must
+        bit-match forward_sequence's burn-in fold k, and the final online
+        macro-context must equal the loss window's frozen macro_context.
+
+        RSSM._sample is patched to return the distribution mean so posterior
+        sampling is deterministic and the two paths are exactly comparable
+        (both still exercise the real posterior head, just without its
+        stochastic sampling noise)."""
+        monkeypatch.setattr(RSSM, "_sample", lambda self, stats: RSSM.dist_params(stats)[0])
+
+        torch.manual_seed(0)
         thumper = Trainer(
             TrainerConfig(thumper=small_config(), output_dir=str(tmp_path), resume=False, device="cpu")
         ).thumper
         device = "cpu"
         wm = thumper.world_model
 
-        # -- reference: old inline logic, reimplemented here for comparison --
-        from collections import deque
+        T = 5
+        torch.manual_seed(42)
+        frames = [torch.randint(0, 16, (GRID, GRID)) for _ in range(T)]
+        actions = [0] + [1 + (t % 3) for t in range(1, T)]
+        rewards = [0.0] + [float(t % 2) for t in range(1, T)]
 
-        first_frame = _frame(0)
-        K = wm.config.frame_stack
-        ref_frame_stack = deque([first_frame] * K, maxlen=K)
-        ref_deter, ref_stoch = wm.rssm.initial_state(1, device)
-        ref_macro_context = wm.task_encoder.initial_state(1, device)
-        ref_prev_action_onehot = torch.zeros(1, wm.config.action_dim, device=device)
+        records: dict[str, list] = {"online": [], "training": []}
+        current = ["online"]
+        orig_forward = type(wm.task_encoder).forward
 
-        def ref_act(available_actions):
-            nonlocal ref_deter, ref_stoch
-            stack = torch.stack(list(ref_frame_stack), dim=0).unsqueeze(0).to(device)
-            embed = wm.encode(stack)
-            ref_deter, ref_stoch = wm.rssm.observe_step(
-                ref_deter, ref_stoch, ref_prev_action_onehot, embed, ref_macro_context
-            )
-            num_types = wm.config.num_action_types
-            mask = torch.zeros(num_types, dtype=torch.bool)
-            for a in available_actions:
-                if a < num_types:
-                    mask[a] = True
-            out = thumper.act(ref_deter, ref_stoch, ref_macro_context, mask.unsqueeze(0).to(device))
-            return int(out["action_type"].item()), tuple(out["coords"][0].tolist()), mask
+        def recording_forward(self, m, deter, stoch, action, reward):
+            records[current[0]].append((deter.detach().clone(), action.detach().clone(), reward.detach().clone()))
+            return orig_forward(self, m, deter, stoch, action, reward)
 
-        def ref_observe(action_type, coords, reward, frame):
-            nonlocal ref_macro_context, ref_prev_action_onehot
-            action_type_t = torch.tensor([action_type], device=device)
-            coords_t = torch.tensor([coords], device=device)
-            action_onehot = wm.encode_actions(action_type_t, coords_t)
-            reward_t = torch.tensor([[reward]], device=device)
-            with torch.no_grad():
-                ref_macro_context = wm.task_encoder(
-                    ref_macro_context, ref_deter, ref_stoch, action_onehot, reward_t
-                )
-            ref_prev_action_onehot = action_onehot
-            ref_frame_stack.append(frame)
+        monkeypatch.setattr(type(wm.task_encoder), "forward", recording_forward)
 
-        # -- OnlineActor, driven from the same seed and the same script --
+        current[0] = "online"
         actor = OnlineActor(thumper, device)
-        actor.begin_episode(first_frame)
+        actor.begin_episode(frames[0])
+        for t in range(1, T):
+            actor.act([RESET, 1, 2, 3], greedy=True)
+            actor.observe(actions[t], (0, 0), rewards[t], frames[t])
 
-        available = [RESET, 1, 2]
-        for t in range(5):
-            # Reseed identically before each paired call: ref_act and
-            # actor.act must draw from the same RNG state to be comparable,
-            # since they're invoked sequentially (not interleaved) on a
-            # shared global RNG stream.
-            torch.manual_seed(100 + t)
-            ref_type, ref_coords, _ = ref_act(available)
-            torch.manual_seed(100 + t)
-            actor_type, actor_coords, _ = actor.act(available)
-            assert ref_type == actor_type
-            assert ref_coords == actor_coords
+        current[0] = "training"
+        stacks = [
+            torch.stack([frames[max(i, 0)] for i in range(t - STACK + 1, t + 1)]) for t in range(T)
+        ]
+        obs = torch.stack(stacks).unsqueeze(0)
+        action_types = torch.tensor([actions])
+        coords = torch.zeros(1, T, 2, dtype=torch.long)
+        is_first = torch.tensor([[True] + [False] * (T - 1)])
+        rewards_t = torch.tensor([rewards]).float()
+        with torch.no_grad():
+            out = wm.forward_sequence(
+                obs, action_types, coords, is_first, rewards=rewards_t, burn_in=T - 1
+            )
 
-            frame = _frame(t + 1)
-            ref_observe(ref_type, ref_coords, 0.0, frame)
-            actor.observe(actor_type, actor_coords, 0.0, frame)
+        # actor.act's first call performs the zero-fold seeded by
+        # begin_episode; forward_sequence's burn-in loop performs T-1 folds
+        # (folds 1..T-1), one per act() call here -- same count.
+        assert len(records["online"]) == len(records["training"]) == T - 1
+        for k in range(T - 1):
+            (d_on, a_on, r_on), (d_tr, a_tr, r_tr) = records["online"][k], records["training"][k]
+            # deter is allclose, not exactly equal: both paths recompute it
+            # via the same GRU ops but through different call sites, and
+            # float non-associativity introduces ~1e-8 noise that has
+            # nothing to do with the alignment bug this test targets --
+            # action/reward (the actual fold inputs this ticket fixes) are
+            # asserted exact.
+            assert torch.allclose(d_on, d_tr, atol=1e-5), f"fold {k}: deter mismatch"
+            assert torch.equal(a_on, a_tr), f"fold {k}: action mismatch"
+            assert torch.equal(r_on, r_tr), f"fold {k}: reward mismatch"
 
-        assert torch.equal(ref_macro_context, actor._macro_context)
-        assert torch.equal(ref_deter, actor._deter)
-        assert torch.equal(ref_stoch, actor._stoch)
+        assert torch.allclose(actor._macro_context, out["macro_context"][0, 0], atol=1e-5)
+
+    def test_zero_fold_at_episode_start(self, tmp_path, monkeypatch):
+        """The first act() after begin_episode folds a zeroed action/reward
+        alongside the first observation's posterior state -- mirrors
+        forward_sequence's is_first zero-fold (tickets/0008)."""
+        monkeypatch.setattr(RSSM, "_sample", lambda self, stats: RSSM.dist_params(stats)[0])
+
+        thumper = Trainer(
+            TrainerConfig(thumper=small_config(), output_dir=str(tmp_path), resume=False, device="cpu")
+        ).thumper
+        wm = thumper.world_model
+
+        recorded = []
+        orig_forward = type(wm.task_encoder).forward
+
+        def recording_forward(self, m, deter, stoch, action, reward):
+            recorded.append((deter.detach().clone(), action.detach().clone(), reward.detach().clone()))
+            return orig_forward(self, m, deter, stoch, action, reward)
+
+        monkeypatch.setattr(type(wm.task_encoder), "forward", recording_forward)
+
+        actor = OnlineActor(thumper, "cpu")
+        actor.begin_episode(_frame(0))
+        actor.act([RESET, 1, 2], greedy=True)
+
+        assert len(recorded) == 1
+        deter, action, reward = recorded[0]
+        assert torch.equal(deter, actor._deter)
+        assert torch.equal(action, torch.zeros_like(action))
+        assert torch.equal(reward, torch.zeros_like(reward))
 
     def test_trainer_collect_loop_unchanged_by_refactor(self, tmp_path):
         """Headline invariant: with a fixed seed and identical weights,

@@ -12,6 +12,17 @@ must exist in exactly one place: a divergence between a collector copy and
 an evaluator copy would silently make eval measure a different agent than
 the one being trained. `Trainer` and the evaluator are both just callers of
 this class.
+
+TaskEncoder folds use `forward_sequence`'s arrival-state convention (the
+only convention the TaskEncoder is ever trained under, see
+model/world_model.py's burn-in loop): a fold consumes the transition that
+*arrived at* the state it's called with -- (deter_t, stoch_t) at observation
+t, the action that produced t, and the reward that arrived with t. Online,
+that arrival state for transition t->t+1 only exists once the *next* `act()`
+call has advanced the RSSM onto t+1, so `observe()` merely stashes the
+pending (action, reward) and `act()` performs the fold right after its
+`observe_step`, before the policy reads features -- per-step ordering
+becomes exactly forward_sequence's: step -> fold -> act (tickets/0008).
 """
 from collections import deque
 
@@ -36,13 +47,17 @@ class OnlineActor:
         self._stoch: torch.Tensor | None = None
         self._macro_context: torch.Tensor | None = None
         self._prev_action_onehot: torch.Tensor | None = None
+        self._pending_action_onehot: torch.Tensor | None = None
+        self._pending_reward: torch.Tensor | None = None
 
     def begin_episode(self, first_frame: torch.Tensor) -> None:
         """Reset the per-episode latent state from an episode's first frame:
         frame-stack deque (K copies of it), RSSM initial_state, TaskEncoder
         initial_state, and a zeroed previous action -- mirrors
         forward_sequence's is_first convention (no real action produced the
-        first observation)."""
+        first observation). The pending TaskEncoder fold is seeded zeroed
+        too, so the first `act()` performs the same zero-fold on the first
+        observation that training's burn-in performs at an is_first step."""
         wm = self.thumper.world_model
         device = self.device
         K = wm.config.frame_stack
@@ -50,23 +65,33 @@ class OnlineActor:
         self._deter, self._stoch = wm.rssm.initial_state(1, device)
         self._macro_context = wm.task_encoder.initial_state(1, device)
         self._prev_action_onehot = torch.zeros(1, wm.config.action_dim, device=device)
+        self._pending_action_onehot = torch.zeros(1, wm.config.action_dim, device=device)
+        self._pending_reward = torch.zeros(1, 1, device=device)
 
     @torch.no_grad()
     def act(
         self, available_actions: list[int], greedy: bool = False
     ) -> tuple[int, tuple[int, int], torch.Tensor]:
         """One online step of the policy: encode the current frame stack,
-        step the RSSM posterior, and sample (or, if greedy, argmax) an
-        action -- mirrors forward_sequence's per-step ordering exactly
-        (encode -> observe_step -> act). Returns (action_type, coords, mask)
-        so the caller can store the mask the action was chosen under
-        alongside the resulting step."""
+        step the RSSM posterior, fold the pending transition into the
+        macro-context, and sample (or, if greedy, argmax) an action --
+        mirrors forward_sequence's per-step ordering exactly (step -> fold ->
+        act, both consuming the same arrival state; tickets/0008). Returns
+        (action_type, coords, mask) so the caller can store the mask the
+        action was chosen under alongside the resulting step."""
         wm = self.thumper.world_model
         device = self.device
         stack = torch.stack(list(self._frame_stack), dim=0).unsqueeze(0).to(device)
         embed = wm.encode(stack)
         self._deter, self._stoch = wm.rssm.observe_step(
             self._deter, self._stoch, self._prev_action_onehot, embed, self._macro_context
+        )
+        # Arrival-state convention (forward_sequence's burn-in loop): fold
+        # the transition that just arrived at (self._deter, self._stoch)
+        # using the action/reward that produced it, before the policy reads
+        # features -- not the outgoing action about to be chosen.
+        self._macro_context = wm.task_encoder(
+            self._macro_context, self._deter, self._stoch, self._pending_action_onehot, self._pending_reward
         )
         mask = self._mask_from_available(available_actions)
         out = self.thumper.act(
@@ -79,21 +104,27 @@ class OnlineActor:
     def observe(
         self, action_type: int, coords: tuple[int, int], reward: float, frame: torch.Tensor
     ) -> None:
-        """Fold a completed real transition into the online latent state:
-        advance the frame stack and update macro_context (the TaskEncoder
-        *does* step online, on real transitions -- the imagination freeze
-        rule only applies to dreamed ones, see tickets/0003)."""
+        """Record a completed real transition: advance the frame stack and
+        stash (action, reward) as the pending TaskEncoder fold. The fold
+        itself doesn't happen here -- the arrival state it needs to consume
+        alongside this action/reward (deter_{t+1}, stoch_{t+1}) doesn't exist
+        yet; it's produced by the *next* `act()` call's `observe_step`, which
+        performs the fold right after (see `act`, tickets/0008)."""
         wm = self.thumper.world_model
         device = self.device
         action_type_t = torch.tensor([action_type], device=device)
         coords_t = torch.tensor([coords], device=device)
         action_onehot = wm.encode_actions(action_type_t, coords_t)
         reward_t = torch.tensor([[reward]], device=device)
-        with torch.no_grad():
-            self._macro_context = wm.task_encoder(
-                self._macro_context, self._deter, self._stoch, action_onehot, reward_t
-            )
+        # _prev_action_onehot (RSSM's prev-action input) and
+        # _pending_action_onehot (TaskEncoder's next-fold input) hold the
+        # same value between calls but serve different consumers under
+        # different conventions -- keep them separate named fields so the
+        # two stay legible rather than collapsing into one field with two
+        # meanings.
         self._prev_action_onehot = action_onehot
+        self._pending_action_onehot = action_onehot
+        self._pending_reward = reward_t
         self._frame_stack.append(frame)
 
     def _mask_from_available(self, available_actions: list[int]) -> torch.Tensor:
