@@ -17,7 +17,18 @@ Absorbing-score extrinsic returns (tickets/0006): a predicted score is
 absorbing for the extrinsic stream only -- once a dream banks one, the
 discount chain for everything after it is multiplied toward zero, so a
 single dream can claim at most ~one level completion's worth of extrinsic
-return, matching what the real environment actually pays.
+return *from that rollout*. This caps hallucinated farming inside
+imagination (the world model has seen very few real level-completion
+transitions and the actor was learning to re-trigger the reward head on
+states nothing real ever anchored) -- it is not a claim that the real
+environment pays out only once per episode. Games routinely chain several
+level completions in one episode (`arcengine`'s `next_level()` keeps
+`state` at `NOT_FINISHED` and just advances `_current_level_index`/`_score`
+until the last level); that multi-level structure is still learned, just
+not from a single dream -- via the critic's bootstrapped value at the
+dream's start state and via real-play buffer episodes, whose `continue`
+target stays true across a level transition (only `result.done`, i.e.
+WIN/GAME_OVER, terminates).
 """
 from dataclasses import dataclass
 
