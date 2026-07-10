@@ -960,6 +960,83 @@ after resume.
   tests (tickets/0006's Step 4 test 5) passing in unit tests but not
   covering some interaction the full run exposes.
 
+**Checkpoint probe, updated for this ticket.** Run 5's probe (reused above)
+measured raw dream reward sums, which absorption never touches by design —
+the fix operates on the λ-return's discount chain, downstream of the reward
+head's raw predictions. A checkpoint can still show per-dream reward sums
+> 1 post-fix; that alone proves nothing about tickets/0006. The quantity
+the acceptance criterion actually names is the extrinsic λ-return, `R_ext`,
+computed with the absorbing discount:
+
+```sh
+PYTHONPATH=. uv run python - <<'EOF'
+import torch
+from model.thumper import Thumper
+from training.actor_critic import ActorCriticConfig, lambda_returns
+from training.replay_buffer import ReplayBuffer
+
+torch.manual_seed(0)
+th = Thumper.load("runs/two_stream_returns/latest.pt"); th.eval()
+wm = th.world_model
+buf = ReplayBuffer.load("runs/two_stream_returns/buffer.pt",
+                        frame_stack=wm.config.frame_stack,
+                        internal_state_dim=wm.config.internal_state_dim)
+cfg = ActorCriticConfig()
+BURN, SEQ, H = 16, 16, 15
+for name, frac in [("uniform starts", 0.0), ("reward-window starts", 1.0)]:
+    b = buf.sample(16, BURN + SEQ, reward_frac=frac, loss_offset=BURN)
+    with torch.no_grad():
+        out = wm.forward_sequence(b["observations"], b["action_types"], b["coords"],
+                                  b["is_first"], rewards=b["rewards"], burn_in=BURN)
+        N = 16 * SEQ
+        d = th.dream(out["deter"].reshape(N, -1), out["stoch"].reshape(N, -1),
+                     out["macro_context"].reshape(N, -1),
+                     b["available_actions"][:, BURN:].reshape(N, -1), horizon=H)
+        target_values = th.critic_target(d["features"])
+
+    discounts = cfg.gamma * d["continue_prob"]
+    r = d["reward"]
+    print(f"== {name} ==")
+    print(f"  dream ext reward (raw, NOT what this ticket bounds): "
+          f"per-dream sum mean={r.sum(1).mean():.3f} max={r.sum(1).max():.3f}")
+
+    # Pre-fix: what R_ext would have been with the unmodified discount chain.
+    returns_ext_unbounded = lambda_returns(r, discounts, target_values[..., 0], cfg.return_lambda)
+    # Post-fix (tickets/0006): absorbing discount -- this is the quantity
+    # the acceptance criterion bounds to ~<= 1.
+    absorb = 1.0 - r.clamp(0.0, 1.0)
+    returns_ext_bounded = lambda_returns(r, discounts * absorb, target_values[..., 0], cfg.return_lambda)
+
+    print(f"  R_ext, pre-fix discount:  t0 mean={returns_ext_unbounded[:, 0].mean():.3f} "
+          f"max={returns_ext_unbounded[:, 0].max():.3f}")
+    print(f"  R_ext, absorbing (0006): t0 mean={returns_ext_bounded[:, 0].mean():.3f} "
+          f"max={returns_ext_bounded[:, 0].max():.3f}")
+EOF
+```
+
+Reading this probe's output: `R_ext, absorbing (0006)` is the number to
+check against criterion 3 (bounded ≈ ≤ 1 from reward-window starts). If the
+checkpoint being probed was trained *before* the fix landed in
+`actor_critic_losses` (i.e. its critic/policy were shaped by the unbounded
+objective), `R_ext, absorbing` will still be computed correctly here since
+this script applies the absorbing discount itself regardless of what the
+checkpoint's training loop used — but `value_ext_mean`/`return_norm_scale_ext`
+baked into that checkpoint's critic will still reflect the old, inflated
+training. Only a checkpoint whose *training* used the fix (i.e. produced by
+rerunning `train.py` after this ticket landed) validates the fix end to
+end; probing an old checkpoint with the new formula validates the formula,
+not the training outcome.
+
+Sanity-run against Run 5's checkpoint (pre-fix training, formula applied
+post-hoc) confirms exactly that split: at reward-window starts, `R_ext`
+drops from a pre-fix-discount 6.61 mean (max 9.35) to an absorbing 2.19
+mean (max 4.41) — the discount change visibly caps the tail, but it's still
+> 1, because `target_values` here come from `critic_target` shaped by
+~23k grad steps of the *unbounded* objective (v_ext ≈ 6.6 baked in). This
+is the expected shape of evidence from an old checkpoint: the formula bites
+immediately, but criterion 3's ≤ 1 bound is a property of a critic *trained*
+under the fix, which only the Run 6 resume produces.
+
 ## Findings
 
 (fill in after / during the run)
