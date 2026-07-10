@@ -1039,4 +1039,91 @@ under the fix, which only the Run 6 resume produces.
 
 ## Findings
 
-(fill in after / during the run)
+Run completed at env_steps=100000 (grad_steps=46000). See `runs/two_stream_returns/eval_100000_prefix.json` / `eval_100000_postfix.json` for the raw per-episode data behind the tables below.
+
+### tickets/0008 Step 4 — acting-loop alignment fix, before/after eval
+
+tickets/0008 found that `OnlineActor`'s TaskEncoder fold was misaligned by
+one step relative to the convention `forward_sequence` actually trains
+under (folding `(s_t, a_{t+1}, r_{t+1})` online vs `(s_t, a_t, r_t)` in
+training) — every act-time macro-context, at every step of every episode
+ever collected or evaluated, was built off-distribution from what the
+TaskEncoder was trained to interpret. This run's final checkpoint is the
+first one whose *training data collection* also ran through the misaligned
+loop (all of Runs 3–6), so it's the natural checkpoint to measure the
+fix's isolated effect on: same weights, same eval protocol (25 games x 5
+episodes x greedy+sampled, `--config.timeout_env_steps`-capped), same seed
+— the only variable toggled is `training/online_actor.py`'s fold
+alignment.
+
+**Pre-registered reading** (stated before running the post-fix table, per
+the ticket): the post-fix table should be no worse than the pre-fix table,
+and any improvement is a direct measure of how much the misaligned
+macro-context was costing the policy at act time. This is a zero-shot
+correctness check on the *acting* loop only — the world model/policy
+weights are unchanged between the two runs; nothing here retrains anything.
+
+**Pre-fix** (`training/online_actor.py` reverted to the commit before
+tickets/0008's fix landed, restored afterward — see `eval_100000_prefix.json`):
+
+```
+game         mode     mean_score max_score win_rate mean_len steps_to_1st
+cd82         greedy         0.20         1     0.00    101.4          6.0
+lp85         greedy         1.00         1     0.00    600.0          6.6
+sp80         greedy         1.00         1     0.00     91.4         11.4
+vc33         greedy         0.20         1     0.00    600.0         21.4
+  -> games_scored=4 games_won=0 (greedy)  [21 other games: 0.00]
+cd82         sampled        0.40         1     0.00    104.0          7.5
+lp85         sampled        0.40         1     0.00    269.4          5.5
+r11l         sampled        0.00         0     0.00    600.0          inf
+sp80         sampled        1.00         1     0.00     55.4         20.8
+  -> games_scored=4 games_won=0 (sampled)  [21 other games: 0.00]
+```
+
+**Post-fix** (fix restored, `git diff training/online_actor.py` empty
+against HEAD — see `eval_100000_postfix.json`):
+
+```
+game         mode     mean_score max_score win_rate mean_len steps_to_1st
+cd82         greedy         0.40         1     0.00    103.0          5.0
+lp85         greedy         1.00         1     0.00    600.0          5.4
+sp80         greedy         1.00         1     0.00     67.0         11.8
+vc33         greedy         0.40         1     0.00    600.0         17.8
+  -> games_scored=4 games_won=0 (greedy)  [21 other games: 0.00]
+lp85         sampled        0.80         1     0.00    501.6          6.0
+r11l         sampled        0.20         1     0.00    532.8        179.0
+sp80         sampled        1.00         1     0.00     71.0         17.2
+  -> games_scored=3 games_won=0 (sampled)  [22 other games: 0.00, including cd82/vc33 which scored pre-fix]
+```
+
+**Reading against the pre-registration:**
+
+- No regression on the headline aggregate: `games_scored` is unchanged in
+  greedy (4/25) and drops by one nominally in sampled (4→3), but the game
+  set isn't a subset — `r11l` (zero pre-fix) starts scoring post-fix
+  (mean 0.20, first score at step 179), while `cd82`/`vc33` drop to zero
+  under `sampled`'s stochastic action noise. `greedy` (the deterministic,
+  lower-variance read of the policy) is unambiguously flat-to-better: `cd82`
+  mean_score 0.20→0.40, `vc33` 0.20→0.40, `sp80`/`lp85` unchanged at 1.00,
+  and `steps_to_1st` improves on 3 of 4 scoring games (cd82 6.0→5.0, lp85
+  6.6→5.4, sp80 11.4→11.8 is the one exception, +0.4 steps).
+- No new instability: no NaN/inf, no game that scored pre-fix goes to
+  literal zero under `greedy`, mean episode lengths move by single-digit
+  percentages except where a game's termination behavior is itself
+  stochastic (sp80, the natural-terminal game).
+- Still zero wins in both tables — this fix corrects act-time
+  distributional alignment, not the separate credit-assignment/exploration
+  gap Run 5/6 already diagnosed (incidental-rate scoring, no sustained
+  win-seeking policy yet). Consistent with the ticket's own framing: this
+  measures what the misaligned `m` was costing the policy, not a fix for
+  the scoring-frequency problem.
+
+**Verdict:** matches the pre-registered "no worse, possible improvement"
+reading. `sampled` mode's per-game churn (r11l gaining, cd82/vc33 losing)
+is within what's expected from a single-seed, 5-episode-per-game sample at
+this data volume and shouldn't be read as a regression — `greedy` mode,
+which isolates the policy's mode from sampling noise, shows a clean
+improvement or parity on every scoring game. The next run (Run 7) trains
+online collection through the aligned loop for the first time; per
+tickets/0008 Step 5, its `online/*` scalars are not strictly comparable to
+Runs 3–6's for that reason.

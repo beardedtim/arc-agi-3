@@ -76,6 +76,17 @@ class TrainerConfig:
     """Env steps collected before the first gradient step."""
     timeout_env_steps: int = 600
     """How many steps before we rotate games if the agent does not end the game first"""
+    train_games: list[str] = field(default_factory=list)
+    """Restrict online collection's round-robin to these games; [] -> every
+    downloaded game (Env.games()), today's default behavior. The held-out-
+    games generalization protocol (tickets/0009) uses this to keep a fixed
+    subset of downloaded games out of training entirely, so eval on the rest
+    measures zero-shot transfer. `eval_games`/`eval.py` are independent and
+    may evaluate any downloaded game regardless of this filter. Invariant:
+    a generalization run must train from scratch (no `init_from`) -- every
+    checkpoint produced before this filter existed trained on all games, so
+    warm-starting from one bakes held-out dynamics into the weights in a way
+    this filter cannot detect or undo."""
 
     # buffer
     buffer_capacity: int = 200_000
@@ -194,6 +205,23 @@ class Trainer:
         if c.resume and self.checkpoint_path().exists():
             payload = torch.load(self.checkpoint_path(), map_location=c.device, weights_only=False)
             c.thumper = payload["config"]
+            # Guard against silent buffer contamination (tickets/0009): a
+            # resumed run's buffer.pt was collected under the checkpoint's
+            # train_games, and Episode.game_id indexes that filtered
+            # enumeration -- changing the list across a resume would both
+            # re-key every stored episode's game_id and (for a held-out
+            # protocol) let held-out episodes already in the buffer train
+            # the world model. Old checkpoints predating this field resumed
+            # under the implicit train_games=[] (all games).
+            checkpoint_train_games = getattr(payload.get("trainer_config"), "train_games", [])
+            if checkpoint_train_games != c.train_games:
+                raise ValueError(
+                    f"Resume train_games mismatch: checkpoint {self.checkpoint_path()} was collected "
+                    f"with train_games={checkpoint_train_games!r}, but this run requested "
+                    f"train_games={c.train_games!r}. Changing the training game list across a resume "
+                    f"silently re-keys buffered episodes' game_id and can leak held-out data into "
+                    f"training. Start a fresh --config.output-dir instead."
+                )
 
         self.thumper = Thumper(c.thumper).to(c.device)
         self.actor_state = OnlineActor(self.thumper, c.device)
@@ -254,9 +282,20 @@ class Trainer:
 
     def _games(self) -> list[str]:
         if not self._game_cycle:
-            self._game_cycle = self.env.games()
-            if not self._game_cycle:
+            available = self.env.games()
+            if not available:
                 raise RuntimeError("no games found in environment_files/")
+            train_games = self.config.train_games
+            if train_games:
+                unknown = sorted(set(train_games) - set(available))
+                if unknown:
+                    raise ValueError(
+                        f"train_games contains games not found in environment_files/: {unknown}. "
+                        f"Available games: {available}"
+                    )
+                # preserve Env.games()'s sorted order, not train_games' order
+                available = [g for g in available if g in set(train_games)]
+            self._game_cycle = available
         return self._game_cycle
 
     def game_ids(self) -> dict[str, int]:

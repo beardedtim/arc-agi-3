@@ -4,7 +4,7 @@ sample renderers. Uses small_config() so the suite stays fast and CPU-only;
 no real env needed."""
 import torch
 
-from env.env import StepResult
+from env.env import Env, StepResult
 from model.actions import NUM_ACTION_TYPES, RESET
 from tests.conftest import GRID, STACK, small_config
 from training.qualitative import save_imagination_check, save_recon_check
@@ -285,6 +285,135 @@ class TestTrainer:
         assert warm.grad_steps == 0
         assert warm.env_steps == 0
         assert warm.buffer.total_steps == 0
+
+
+class TestTrainGamesFilter:
+    """tickets/0009: train_games restricts the online collector's round-robin
+    to a subset of downloaded games, and a resume with a different list must
+    refuse to run (buffer contamination guard)."""
+
+    def _fake_result(self, game: str) -> StepResult:
+        return StepResult(
+            frame=torch.zeros(GRID, GRID, dtype=torch.long),
+            reward=0,
+            done=False,
+            won=False,
+            available_actions=[RESET],
+            levels_completed=0,
+        )
+
+    def _wire_fake_env(self, trainer: Trainer, games: list[str]) -> None:
+        """Point the trainer's real Env instance at a scripted 3-game
+        catalog -- games()/reset()/step() only, following
+        TestTruncation's pattern (no real arc_agi env touched)."""
+        trainer.env.games = lambda: games
+        trainer.env.reset = lambda game: self._fake_result(game)
+        trainer.env.step = lambda action_type, x=None, y=None: self._fake_result(trainer._current_game)
+
+    def _trainer(self, tmp_path, games=("g1", "g2", "g3"), **overrides) -> Trainer:
+        overrides.setdefault("output_dir", str(tmp_path))
+        overrides.setdefault("resume", False)
+        cfg = TrainerConfig(thumper=small_config(), batch_size=2, seq_len=3, **overrides)
+        trainer = Trainer(cfg)
+        self._wire_fake_env(trainer, list(games))
+        return trainer
+
+    def test_filter_respected_and_sorted(self, tmp_path):
+        trainer = self._trainer(tmp_path, train_games=["g2", "g1"])
+        # sorted order preserved from Env.games(), not train_games' order
+        assert trainer._games() == ["g1", "g2"]
+        assert trainer.game_ids() == {"g1": 0, "g2": 1}
+
+    def test_filter_restricts_round_robin_and_buffer_game_ids(self, tmp_path):
+        trainer = self._trainer(tmp_path, train_games=["g2", "g1"], prefill_steps=10_000)
+        seen_games = set()
+        for _ in range(6):
+            result, episode = trainer._begin_episode()
+            seen_games.add(trainer._current_game)
+            trainer._step_latent(RESET, (0, 0), 0.0, result.frame)
+
+        assert seen_games <= {"g1", "g2"}
+        assert "g3" not in seen_games
+        id_to_game = {i: g for g, i in trainer.game_ids().items()}
+        for episode in trainer.buffer.episodes:
+            assert id_to_game[episode.game_id] in {"g1", "g2"}
+
+    def test_unknown_game_raises_loudly(self, tmp_path):
+        trainer = self._trainer(tmp_path, train_games=["g1", "nope"])
+        try:
+            trainer._games()
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "nope" in str(e)
+            assert "g1" in str(e) and "g2" in str(e) and "g3" in str(e)
+
+    def test_default_empty_list_is_all_games(self, tmp_path):
+        trainer = self._trainer(tmp_path, train_games=[])
+        assert trainer._games() == ["g1", "g2", "g3"]
+
+    def test_resume_guard_fires_on_mismatch(self, tmp_path):
+        trainer = self._trainer(tmp_path, train_games=["g1"])
+        trainer.env_steps = 5
+        trainer.save_checkpoint()
+
+        try:
+            Trainer(TrainerConfig(thumper=small_config(), output_dir=str(tmp_path), train_games=["g1", "g2"]))
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "g1" in str(e)
+
+    def test_resume_guard_allows_matching_list(self, tmp_path):
+        trainer = self._trainer(tmp_path, train_games=["g1"])
+        trainer.env_steps = 5
+        trainer.save_checkpoint()
+
+        resumed = Trainer(TrainerConfig(thumper=small_config(), output_dir=str(tmp_path), train_games=["g1"]))
+        assert resumed.env_steps == 5
+
+    def test_resume_guard_old_checkpoint_defaults_to_empty_list(self, tmp_path):
+        """A checkpoint saved before this ticket's trainer_config.train_games
+        field existed resumes cleanly only against train_games=[] (the
+        implicit historical behavior of training on every game)."""
+        trainer = self._trainer(tmp_path, train_games=[])
+        trainer.env_steps = 5
+        trainer.save_checkpoint()
+
+        # simulate an old-style payload missing the field entirely
+        payload = torch.load(trainer.checkpoint_path(), weights_only=False)
+        del payload["trainer_config"].train_games
+        torch.save(payload, trainer.checkpoint_path())
+
+        resumed = Trainer(TrainerConfig(thumper=small_config(), output_dir=str(tmp_path), train_games=[]))
+        assert resumed.env_steps == 5
+
+        try:
+            Trainer(TrainerConfig(thumper=small_config(), output_dir=str(tmp_path), train_games=["g1"]))
+            assert False, "expected ValueError"
+        except ValueError:
+            pass
+
+    def test_eval_independent_of_train_games(self, tmp_path):
+        """train_games restricts collection only -- eval_games names any
+        downloaded game regardless, and the collector's buffer never touches
+        a held-out game (tickets/0009 Design principle 1 / Step 3.5)."""
+        trainer = self._trainer(
+            tmp_path, train_games=["g1"], eval_games=["g2"], eval_episodes_per_game=1, prefill_steps=10_000
+        )
+        eval_env = Env()
+        eval_env.games = lambda: ["g1", "g2", "g3"]
+        eval_env.reset = lambda game: self._fake_result(game)
+        eval_env.step = lambda action_type, x=None, y=None: self._fake_result("g2")
+        trainer._eval_env = eval_env
+
+        for _ in range(3):
+            result, episode = trainer._begin_episode()
+            trainer._step_latent(RESET, (0, 0), 0.0, result.frame)
+
+        trainer._run_eval_hook()
+
+        id_to_game = {i: g for g, i in trainer.game_ids().items()}
+        for episode in trainer.buffer.episodes:
+            assert id_to_game[episode.game_id] == "g1"
 
 
 class TestTruncation:
