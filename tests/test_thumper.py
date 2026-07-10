@@ -31,14 +31,17 @@ def test_act_bridges_latent_to_action(thumper):
     deter, stoch = torch.randn(B, c.deter_dim), torch.randn(B, c.stoch_dim)
     macro_context = torch.randn(B, context_dim)
     out = thumper.act(deter, stoch, macro_context)
-    assert set(out) == {"action_type", "coords", "log_prob", "value"}
+    assert set(out) == {"action_type", "coords", "log_prob"}
     assert out["action_type"].shape == (B,)
 
 
 def test_parameter_counts(thumper):
     counts = thumper.parameter_counts()
-    assert set(counts) == {"world_model", "policy", "total"}
-    assert counts["total"] == counts["world_model"] + counts["policy"]
+    assert set(counts) == {"world_model", "policy", "critic", "critic_target", "total"}
+    # critic_target is never optimized (requires_grad_(False)), so it
+    # contributes 0 to both its own count and the total -- that's correct.
+    assert counts["critic_target"] == 0
+    assert counts["total"] == counts["world_model"] + counts["policy"] + counts["critic"]
     assert counts["total"] == sum(p.numel() for p in thumper.parameters() if p.requires_grad)
     assert "Thumper" in thumper.summary()
 

@@ -1,13 +1,19 @@
 """
-Trainer :: online world-model training loop for Thumper.
+Trainer :: online world-model + actor-critic training loop for Thumper.
 
-Interleaves collection and training the way theo's online loop does: each
-env step (uniform-random policy over available_actions, round-robin across
-every downloaded game) feeds the replay buffer, and gradient steps on
-WorldModel.compute_losses catch up at a fixed env-steps-per-grad-step ratio
-(`train_every`) after a `prefill_steps` warmup. The policy module is
-untouched (see tickets/0001): only thumper.world_model.parameters() are
-optimized.
+Interleaves collection and training: each env step feeds the replay buffer
+(uniform-random over available_actions during `prefill_steps`, then the
+policy itself, round-robin across every downloaded game), and gradient
+steps catch up at a fixed env-steps-per-grad-step ratio (`train_every`).
+Each grad step does two things (see tickets/0003):
+  1. one WorldModel.compute_losses update (unchanged from tickets/0001);
+  2. one actor-critic update trained entirely in imagination
+     (`Thumper.dream` + `training/actor_critic.py`): reward = predicted
+     extrinsic reward + Plan2Explore disagreement (intrinsic), REINFORCE
+     with a learned critic baseline (no backprop through dynamics, since
+     the action space is categorical).
+The trained policy replaces the random collector after prefill, so
+exploration becomes disagreement-seeking instead of uniform.
 
 Telemetry goes three places:
   - TensorBoard scalars under `<output_dir>/tb` (losses, per-game episode
@@ -25,6 +31,7 @@ resume. A fresh Trainer resumes from them automatically when
 """
 import random
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +42,7 @@ from torch.utils.tensorboard import SummaryWriter
 from env.env import Env, StepResult
 from model.actions import ACTION6, NUM_ACTION_TYPES, RESET
 from model.thumper import Thumper, ThumperConfig
+from training.actor_critic import ActorCriticConfig, ReturnNormalizer, actor_critic_losses
 from training.qualitative import save_imagination_check, save_recon_check
 from training.replay_buffer import Episode, ReplayBuffer
 
@@ -64,12 +72,35 @@ class TrainerConfig:
     # sequence sampling
     batch_size: int = 16
     seq_len: int = 16
+    burn_in: int = 16
+    """Real steps consumed to build each window's frozen macro-context and
+    warm the RSSM state (tickets/0004); 0 disables burn-in (macro_context
+    stays at its zero initial_state for the whole window -- there's no
+    prefix to build it from). The buffer sample length becomes
+    burn_in + seq_len."""
 
     # optimization
     lr: float = 3e-4
     grad_clip: float = 100.0
     kl_warmup_steps: int = 0
     """Gradient steps of linear KL-weight warmup (0 -> config value); 0 disables."""
+
+    # imagination policy training (tickets/0003)
+    dream_horizon: int = 15
+    """Imagined steps per policy update (Dreamer default); drop toward 8-10
+    if dreams destabilize training -- Run 1 validated coherence to ~8 steps."""
+    gamma: float = 0.997
+    """Discount; episodes run to 600 steps, so 0.99 is too myopic."""
+    return_lambda: float = 0.95
+    """TD(lambda) mixing."""
+    entropy_scale: float = 1e-3
+    actor_lr: float = 8e-5
+    critic_lr: float = 8e-5
+    intrinsic_scale: float = 1.0
+    """Weight on disagreement vs predicted extrinsic reward."""
+    critic_target_every: int = 100
+    """Grad steps between hard target-critic syncs."""
+    return_norm_decay: float = 0.99
 
     # logging / qualitative checks (in gradient steps)
     log_every: int = 50
@@ -134,10 +165,14 @@ class Trainer:
 
         self.thumper = Thumper(c.thumper).to(c.device)
         self.optimizer = torch.optim.Adam(self.thumper.world_model.parameters(), lr=c.lr)
+        self.actor_optimizer = torch.optim.Adam(self.thumper.policy.parameters(), lr=c.actor_lr)
+        self.critic_optimizer = torch.optim.Adam(self.thumper.critic.parameters(), lr=c.critic_lr)
+        self.return_normalizer = ReturnNormalizer(decay=c.return_norm_decay)
         self.buffer = ReplayBuffer(
             capacity=c.buffer_capacity,
             frame_stack=c.thumper.world_model.frame_stack,
             internal_state_dim=c.thumper.world_model.internal_state_dim,
+            num_action_types=c.thumper.world_model.num_action_types,
         )
         self.env_steps = 0
         self.grad_steps = 0
@@ -147,6 +182,9 @@ class Trainer:
         if payload is not None:
             self.thumper.load_state_dict(payload["state_dict"])
             self.optimizer.load_state_dict(payload["optimizer_state_dict"])
+            self.actor_optimizer.load_state_dict(payload["actor_optimizer_state_dict"])
+            self.critic_optimizer.load_state_dict(payload["critic_optimizer_state_dict"])
+            self.return_normalizer.load_state_dict(payload["return_norm_scale"])
             self.env_steps = payload["env_steps"]
             self.grad_steps = payload["grad_steps"]
             if self.buffer_path().exists():
@@ -155,6 +193,7 @@ class Trainer:
                     capacity=c.buffer_capacity,
                     frame_stack=c.thumper.world_model.frame_stack,
                     internal_state_dim=c.thumper.world_model.internal_state_dim,
+                    num_action_types=c.thumper.world_model.num_action_types,
                 )
             print(
                 f"Resumed from {self.checkpoint_path()}: env_steps={self.env_steps}, "
@@ -202,19 +241,79 @@ class Trainer:
         coords = (random.randrange(grid_size), random.randrange(grid_size)) if action_type == ACTION6 else (0, 0)
         return action_type, coords
 
+    def _mask_from_available(self, available_actions: list[int]) -> torch.Tensor:
+        """API's `available_actions` (int list) -> (num_action_types,) bool mask."""
+        num_types = self.config.thumper.world_model.num_action_types
+        mask = torch.zeros(num_types, dtype=torch.bool)
+        for a in available_actions:
+            if a < num_types:
+                mask[a] = True
+        return mask
+
     def _begin_episode(self) -> tuple[StepResult, Episode]:
-        """Reset into the next game and store its first frame. The first
-        step's RESET is a placeholder never consumed by forward_sequence /
+        """Reset into the next game, store its first frame, and reset the
+        per-episode latent state the online policy acts from (frame-stack
+        deque, RSSM state, macro-context, previous action) -- mirrors
+        forward_sequence's is_first convention: no real action produced the
+        first observation, so prev_action starts at zero. The first step's
+        RESET is a placeholder never consumed by forward_sequence /
         compute_losses (is_first marks it), and storing it doesn't count as
         an env step."""
         game = self._next_game()
         self._current_game = game
         result = self.env.reset(game)
         episode = self.buffer.start_episode(game_id=self.game_ids()[game])
+        mask = self._mask_from_available(result.available_actions)
         self.buffer.add_step(
-            episode, result.frame, RESET, (0, 0), 0.0, False, result.levels_completed / MAX_SCORE
+            episode, result.frame, RESET, (0, 0), 0.0, False, result.levels_completed / MAX_SCORE, mask
         )
+
+        wm = self.thumper.world_model
+        device = self.config.device
+        K = wm.config.frame_stack
+        self._frame_stack = deque([result.frame] * K, maxlen=K)
+        self._deter, self._stoch = wm.rssm.initial_state(1, device)
+        self._macro_context = wm.task_encoder.initial_state(1, device)
+        self._prev_action_onehot = torch.zeros(1, wm.config.action_dim, device=device)
         return result, episode
+
+    @torch.no_grad()
+    def _act(self, available_actions: list[int]) -> tuple[int, tuple[int, int], torch.Tensor]:
+        """One online step of the policy: observe the current frame stack,
+        step the RSSM posterior, and sample an action -- mirrors
+        forward_sequence's per-step ordering exactly (encode -> observe_step
+        -> act). Returns (action_type, coords, mask) so the caller can store
+        the mask the action was chosen under alongside the resulting step."""
+        wm = self.thumper.world_model
+        device = self.config.device
+        stack = torch.stack(list(self._frame_stack), dim=0).unsqueeze(0).to(device)
+        embed = wm.encode(stack)
+        self._deter, self._stoch = wm.rssm.observe_step(
+            self._deter, self._stoch, self._prev_action_onehot, embed, self._macro_context
+        )
+        mask = self._mask_from_available(available_actions)
+        out = self.thumper.act(self._deter, self._stoch, self._macro_context, mask.unsqueeze(0).to(device))
+        action_type = int(out["action_type"].item())
+        coords = tuple(out["coords"][0].tolist())
+        return action_type, coords, mask
+
+    def _step_latent(self, action_type: int, coords: tuple[int, int], reward: float, frame: torch.Tensor) -> None:
+        """Fold a completed real transition into the online latent state:
+        advance the frame stack and update macro_context (the TaskEncoder
+        *does* step online, on real transitions -- the imagination freeze
+        rule only applies to dreamed ones, see tickets/0003)."""
+        wm = self.thumper.world_model
+        device = self.config.device
+        action_type_t = torch.tensor([action_type], device=device)
+        coords_t = torch.tensor([coords], device=device)
+        action_onehot = wm.encode_actions(action_type_t, coords_t)
+        reward_t = torch.tensor([[reward]], device=device)
+        with torch.no_grad():
+            self._macro_context = wm.task_encoder(
+                self._macro_context, self._deter, self._stoch, action_onehot, reward_t
+            )
+        self._prev_action_onehot = action_onehot
+        self._frame_stack.append(frame)
 
     # --- training ----------------------------------------------------------
 
@@ -227,9 +326,10 @@ class Trainer:
 
     def train_step(self) -> dict[str, float]:
         c = self.config
-        batch = self.buffer.sample(c.batch_size, c.seq_len)
+        batch = self.buffer.sample(c.batch_size, c.burn_in + c.seq_len)
         batch = {k: v.to(c.device) for k, v in batch.items()}
-        self._last_batch = batch  # reused by the qualitative checks
+        window_batch = {k: v[:, c.burn_in :] for k, v in batch.items()}
+        self._last_batch = batch  # full (burn_in-prefixed) batch, reused by the qualitative checks
 
         wm = self.thumper.world_model
         outputs = wm.forward_sequence(
@@ -238,9 +338,10 @@ class Trainer:
             batch["coords"],
             batch["is_first"],
             rewards=batch["rewards"],
+            burn_in=c.burn_in,
         )
         losses = wm.compute_losses(
-            outputs, batch["observations"], batch=batch, kl_weight=self.kl_weight()
+            outputs, window_batch["observations"], batch=window_batch, kl_weight=self.kl_weight()
         )
 
         self.optimizer.zero_grad()
@@ -251,8 +352,75 @@ class Trainer:
 
         metrics = {k: v.item() for k, v in losses.items()}
         metrics["grad_norm"] = grad_norm.item()
-        self._log_train_scalars(metrics, outputs, batch)
+        self._log_train_scalars(metrics, outputs, window_batch)
+
+        policy_metrics = self.policy_train_step(outputs, window_batch)
+        metrics.update(policy_metrics)
+        self._log_policy_scalars(policy_metrics)
         return metrics
+
+    def policy_train_step(
+        self, outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
+    ) -> dict[str, float]:
+        """One actor-critic update trained entirely in imagination (see
+        tickets/0003): dream from every posterior state this grad step's
+        world-model pass produced, then update actor/critic on the
+        with-grad second pass over that (grad-free) rollout. One policy
+        update per world-model update -- train_every scheduling untouched."""
+        c = self.config
+        thumper = self.thumper
+        B, T = outputs["deter"].shape[:2]
+        N = B * T
+
+        deter = outputs["deter"].reshape(N, -1).detach()
+        stoch = outputs["stoch"].reshape(N, -1).detach()
+        macro_context = outputs["macro_context"].reshape(N, -1).detach()
+        available_actions = batch["available_actions"].reshape(N, -1)
+
+        dream = thumper.dream(deter, stoch, macro_context, available_actions, horizon=c.dream_horizon)
+        ac_cfg = ActorCriticConfig(
+            gamma=c.gamma,
+            return_lambda=c.return_lambda,
+            entropy_scale=c.entropy_scale,
+            intrinsic_scale=c.intrinsic_scale,
+        )
+        losses = actor_critic_losses(
+            dream, thumper.policy, thumper.critic, thumper.critic_target, self.return_normalizer, ac_cfg
+        )
+
+        self.actor_optimizer.zero_grad()
+        losses["actor_loss"].backward()
+        actor_grad_norm = nn.utils.clip_grad_norm_(thumper.policy.parameters(), c.grad_clip)
+        self.actor_optimizer.step()
+
+        self.critic_optimizer.zero_grad()
+        losses["critic_loss"].backward()
+        critic_grad_norm = nn.utils.clip_grad_norm_(thumper.critic.parameters(), c.grad_clip)
+        self.critic_optimizer.step()
+
+        if self.grad_steps % c.critic_target_every == 0:
+            thumper.sync_critic_target()
+
+        metrics = {k: v.item() for k, v in losses.items()}
+        metrics["grad_norm_actor"] = actor_grad_norm.item()
+        metrics["grad_norm_critic"] = critic_grad_norm.item()
+        return metrics
+
+    def _log_policy_scalars(self, metrics: dict[str, float]) -> None:
+        if self.writer is None:
+            return
+        step = self.grad_steps
+        w = self.writer
+        w.add_scalar("policy/actor_loss", metrics["actor_loss"], step)
+        w.add_scalar("policy/critic_loss", metrics["critic_loss"], step)
+        w.add_scalar("policy/entropy", metrics["entropy"], step)
+        w.add_scalar("policy/imagined_return", metrics["imagined_return"], step)
+        w.add_scalar("policy/intrinsic_reward_mean", metrics["intrinsic_mean"], step)
+        w.add_scalar("policy/extrinsic_reward_mean", metrics["extrinsic_mean"], step)
+        w.add_scalar("policy/value_mean", metrics["value_mean"], step)
+        w.add_scalar("policy/return_norm_scale", self.return_normalizer.scale, step)
+        w.add_scalar("policy/grad_norm_actor", metrics["grad_norm_actor"], step)
+        w.add_scalar("policy/grad_norm_critic", metrics["grad_norm_critic"], step)
 
     def _log_train_scalars(
         self, metrics: dict[str, float], outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
@@ -321,10 +489,18 @@ class Trainer:
             window_start_env_steps = self.env_steps
             metrics: dict[str, float] = {}
             env_steps = 0
+            action_type_counts = torch.zeros(c.thumper.world_model.num_action_types)
             while self.env_steps < c.total_env_steps:
                 env_steps += 1
-                # --- environment: one random action -> one buffer step
-                action_type, coords = self._random_action(result.available_actions)
+                # --- environment: act (random during prefill, policy after)
+                # -> one buffer step
+                use_policy = self.env_steps >= c.prefill_steps
+                if use_policy:
+                    action_type, coords, mask = self._act(result.available_actions)
+                else:
+                    action_type, coords = self._random_action(result.available_actions)
+                    mask = self._mask_from_available(result.available_actions)
+                action_type_counts[action_type] += 1
                 x, y = (coords if action_type == ACTION6 else (None, None))
                 result = self.env.step(action_type, x=x, y=y)
                 terminate_due_to_max_steps = env_steps >= c.timeout_env_steps
@@ -338,11 +514,24 @@ class Trainer:
                     float(result.reward),
                     terminated,
                     result.levels_completed / MAX_SCORE,
+                    mask,
                 )
+                self._step_latent(action_type, coords, float(result.reward), result.frame)
 
                 self.env_steps += 1
                 episode_return += float(result.reward)
                 episode_len += 1
+                if self.env_steps % c.log_every == 0:
+                    total = action_type_counts.sum().clamp(min=1.0)
+                    for a in range(c.thumper.world_model.num_action_types):
+                        self.writer.add_scalar(
+                            f"online/action_type_frac/{a}",
+                            (action_type_counts[a] / total).item(),
+                            self.env_steps,
+                        )
+                    self.writer.add_scalar(
+                        "online/macro_context_norm", self._macro_context.norm().item(), self.env_steps
+                    )
                 if terminated:
                     game = self._current_game
                     self.writer.add_scalar("online/episode_return", episode_return, self.env_steps)
@@ -357,7 +546,7 @@ class Trainer:
                     result, episode = self._begin_episode()
 
                 # --- training: catch up to the env-steps-per-grad-step ratio
-                can_train = self.env_steps >= c.prefill_steps and self.buffer.total_steps > c.seq_len
+                can_train = self.env_steps >= c.prefill_steps and self.buffer.total_steps > c.burn_in + c.seq_len
                 if not can_train:
                     # keep the ratio anchor tracking during prefill so the
                     # first trainable step doesn't trigger a catch-up burst
@@ -402,11 +591,12 @@ class Trainer:
 
                     if step % c.qualitative_every == 0 or step == 1:
                         save_recon_check(
-                            self.thumper.world_model, self._last_batch, step, samples_dir, writer=self.writer
+                            self.thumper.world_model, self._last_batch, c.burn_in, step, samples_dir,
+                            writer=self.writer,
                         )
                     if step % c.imagine_every == 0 or step == 1:
                         save_imagination_check(
-                            self.thumper.world_model, self._last_batch, step, samples_dir,
+                            self.thumper.world_model, self._last_batch, c.burn_in, step, samples_dir,
                             c.imagine_horizon, writer=self.writer,
                         )
 
@@ -447,6 +637,9 @@ class Trainer:
             "state_dict": self.thumper.state_dict(),
             "trainer_config": self.config,
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
+            "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
+            "return_norm_scale": self.return_normalizer.state_dict(),
             "env_steps": self.env_steps,
             "grad_steps": self.grad_steps,
         }

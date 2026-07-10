@@ -16,6 +16,8 @@ from pathlib import Path
 
 import torch
 
+from model.actions import NUM_ACTION_TYPES
+
 
 @dataclass
 class Episode:
@@ -34,6 +36,9 @@ class Episode:
     terminateds: list[bool] = field(default_factory=list)
     internal_states: list[float] = field(default_factory=list)
     """Normalized score (levels_completed) at each step."""
+    available_actions: list[torch.Tensor] = field(default_factory=list)
+    """(num_action_types,) bool mask per step: the actions legal *at* that
+    observed state (i.e. alongside frames[t], same indexing)."""
 
     def __len__(self) -> int:
         return len(self.frames)
@@ -46,6 +51,7 @@ class Episode:
         reward: float,
         terminated: bool,
         internal_state: float,
+        available_actions: torch.Tensor,
     ) -> None:
         self.frames.append(frame)
         self.action_types.append(action_type)
@@ -53,15 +59,23 @@ class Episode:
         self.rewards.append(reward)
         self.terminateds.append(terminated)
         self.internal_states.append(internal_state)
+        self.available_actions.append(available_actions)
 
 
 class ReplayBuffer:
     """FIFO-over-whole-episodes buffer capped at `capacity` total steps."""
 
-    def __init__(self, capacity: int = 200_000, frame_stack: int = 4, internal_state_dim: int = 1):
+    def __init__(
+        self,
+        capacity: int = 200_000,
+        frame_stack: int = 4,
+        internal_state_dim: int = 1,
+        num_action_types: int = NUM_ACTION_TYPES,
+    ):
         self.capacity = capacity
         self.frame_stack = frame_stack
         self.internal_state_dim = internal_state_dim
+        self.num_action_types = num_action_types
         self.episodes: list[Episode] = []
         self.total_steps = 0
 
@@ -80,8 +94,11 @@ class ReplayBuffer:
         reward: float,
         terminated: bool,
         internal_state: float,
+        available_actions: torch.Tensor | None = None,
     ) -> None:
-        episode.append(frame, action_type, coords, reward, terminated, internal_state)
+        if available_actions is None:
+            available_actions = torch.ones(self.num_action_types, dtype=torch.bool)
+        episode.append(frame, action_type, coords, reward, terminated, internal_state, available_actions)
         self.total_steps += 1
         self._evict()
 
@@ -115,6 +132,7 @@ class ReplayBuffer:
           terminateds: (B, T) bool
           internal_states: (B, T, internal_state_dim) float32
           game_ids: (B, T) int64 (constant along T; the episode's game)
+          available_actions: (B, T, num_action_types) bool
         Each sequence is a contiguous window from one (randomly chosen,
         length-weighted) episode, clipped to stay in-bounds -- episodes
         shorter than seq_len are padded by repeating their last step
@@ -128,6 +146,7 @@ class ReplayBuffer:
         weights = [len(ep) for ep in eligible]
         obs_batch, type_batch, coord_batch = [], [], []
         first_batch, reward_batch, term_batch, state_batch, game_batch = [], [], [], [], []
+        avail_batch = []
 
         for _ in range(batch_size):
             episode = random.choices(eligible, weights=weights, k=1)[0]
@@ -151,6 +170,7 @@ class ReplayBuffer:
                 torch.tensor([episode.internal_states[t] for t in idxs], dtype=torch.float32).unsqueeze(-1)
             )
             game_batch.append(torch.full((seq_len,), episode.game_id, dtype=torch.long))
+            avail_batch.append(torch.stack([episode.available_actions[t] for t in idxs], dim=0))
 
         return {
             "observations": torch.stack(obs_batch, dim=0),
@@ -161,6 +181,7 @@ class ReplayBuffer:
             "terminateds": torch.stack(term_batch, dim=0),
             "internal_states": torch.stack(state_batch, dim=0),
             "game_ids": torch.stack(game_batch, dim=0),
+            "available_actions": torch.stack(avail_batch, dim=0),
         }
 
     def save(self, path: str | Path) -> None:
@@ -180,6 +201,7 @@ class ReplayBuffer:
                     "rewards": torch.tensor(episode.rewards, dtype=torch.float32),
                     "terminateds": torch.tensor(episode.terminateds, dtype=torch.bool),
                     "internal_states": torch.tensor(episode.internal_states, dtype=torch.float32),
+                    "available_actions": torch.stack(episode.available_actions, dim=0),
                 }
             )
         torch.save({"episodes": payload}, path)
@@ -191,11 +213,22 @@ class ReplayBuffer:
         capacity: int = 200_000,
         frame_stack: int = 4,
         internal_state_dim: int = 1,
+        num_action_types: int = NUM_ACTION_TYPES,
     ) -> "ReplayBuffer":
         """Rebuild a buffer written by `save`. Loading into a smaller
-        `capacity` FIFO-evicts oldest episodes as usual."""
+        `capacity` FIFO-evicts oldest episodes as usual.
+
+        Backward compat: a pre-0003 `buffer.pt` has no "available_actions"
+        key -- fall back to all-True masks (what "no mask" already means to
+        `Policy.act`), so `--config.init-from` workflows against older runs
+        don't crash."""
         payload = torch.load(path, map_location="cpu", weights_only=True)
-        buffer = cls(capacity=capacity, frame_stack=frame_stack, internal_state_dim=internal_state_dim)
+        buffer = cls(
+            capacity=capacity,
+            frame_stack=frame_stack,
+            internal_state_dim=internal_state_dim,
+            num_action_types=num_action_types,
+        )
         for ep in payload["episodes"]:
             episode = buffer.start_episode(game_id=int(ep["game_id"]))
             episode.frames = list(ep["frames"].long().unbind(0))
@@ -204,6 +237,12 @@ class ReplayBuffer:
             episode.rewards = [float(r) for r in ep["rewards"]]
             episode.terminateds = [bool(t) for t in ep["terminateds"]]
             episode.internal_states = [float(s) for s in ep["internal_states"]]
+            if "available_actions" in ep:
+                episode.available_actions = list(ep["available_actions"].bool().unbind(0))
+            else:
+                episode.available_actions = [
+                    torch.ones(num_action_types, dtype=torch.bool) for _ in range(len(episode.frames))
+                ]
             buffer.total_steps += len(episode)
             buffer._evict()
         return buffer

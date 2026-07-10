@@ -8,9 +8,10 @@ eyeballed, not just judged by falling scalars:
     reconstructions (bottom row) -- is the model learning the game's
     appearance at all.
   - ``imagine_step_*.png``: real frames (top) vs an imagination rollout
-    (bottom) fed only the first real frame plus the real action sequence,
-    with no further observations -- the actual test of learned dynamics
-    rather than single-frame compression.
+    (bottom) that burns in on a prefix of real steps (warming the RSSM
+    state and macro-context, tickets/0004), then rolls forward from the
+    burned-in start state with no further observations -- the actual test
+    of learned dynamics rather than single-frame compression.
 
 Files land under ``<output_dir>/samples/`` and are mirrored to TensorBoard
 when a writer is given. The decoder is used here for exactly its intended
@@ -85,25 +86,32 @@ def _save(grid: Image.Image, out_dir: Path, name: str, tag: str, step: int, writ
 def save_recon_check(
     world_model: WorldModel,
     batch: dict[str, torch.Tensor],
+    burn_in: int,
     step: int,
     out_dir: Path,
     writer: SummaryWriter | None = None,
     num_frames: int = 8,
 ) -> None:
     """Decode posterior reconstructions for one sequence and save real vs.
-    reconstructed settled frames side by side."""
-    num_frames = min(num_frames, batch["observations"].shape[1])
+    reconstructed settled frames side by side.
+
+    batch is the full burn_in-prefixed sample (tickets/0004): burn_in real
+    steps warm the RSSM/macro-context, then up to num_frames loss-window
+    steps are reconstructed and shown."""
+    num_frames = min(num_frames, batch["observations"].shape[1] - burn_in)
     with torch.no_grad():
+        end = burn_in + num_frames
         outputs = world_model.forward_sequence(
-            batch["observations"][:1, :num_frames],
-            batch["action_types"][:1, :num_frames],
-            batch["coords"][:1, :num_frames],
-            batch["is_first"][:1, :num_frames],
-            rewards=batch["rewards"][:1, :num_frames],
+            batch["observations"][:1, :end],
+            batch["action_types"][:1, :end],
+            batch["coords"][:1, :end],
+            batch["is_first"][:1, :end],
+            rewards=batch["rewards"][:1, :end],
+            burn_in=burn_in,
         )
         # Only each stack's last (settled) frame is reconstructed -- compare
         # against exactly that.
-        target = world_model.preprocess(batch["observations"][0, :num_frames])[:, -1]
+        target = world_model.preprocess(batch["observations"][0, burn_in:end])[:, -1]
         recon = outputs["recon"][0].argmax(dim=1)
 
     real_row = _row_of_frames([grid_to_image(f) for f in target])
@@ -115,26 +123,31 @@ def save_recon_check(
 def save_imagination_check(
     world_model: WorldModel,
     batch: dict[str, torch.Tensor],
+    burn_in: int,
     step: int,
     out_dir: Path,
     horizon: int,
     writer: SummaryWriter | None = None,
 ) -> None:
-    """Feed only the first real frame stack + the real action sequence, roll
-    the RSSM forward with no further observations, and compare imagined
-    frames to the real ones."""
-    horizon = min(horizon, batch["observations"].shape[1] - 1)
+    """Burn in on the batch's leading burn_in real steps, then roll the RSSM
+    forward with no further observations, and compare imagined frames to the
+    real ones (tickets/0004): this answers "given a warmed-up belief, does
+    the prior hold?" -- the question the actor-critic's dreams actually
+    pose, rather than the pre-0004 cold m=0 start."""
+    total = batch["observations"].shape[1]
+    horizon = min(horizon, total - burn_in - 1)
     with torch.no_grad():
-        first_obs = batch["observations"][:1, 0]
-        # action_types[t] produced observations[t] (the buffer's
-        # prev_action-at-t convention), and imagined frame t+1 consumes the
-        # action that produces it -- so imagining alongside real frames
-        # obs[0..horizon] takes the actions[1..horizon] slice (see
-        # imagine_from_first_frame's docstring).
-        action_types = batch["action_types"][:1, 1 : horizon + 1]
-        coords = batch["coords"][:1, 1 : horizon + 1]
-        imagined = world_model.imagine_from_first_frame(first_obs, action_types, coords)[0].argmax(dim=1)
-        target = world_model.preprocess(batch["observations"][0, : horizon + 1])[:, -1]
+        end = burn_in + 1 + horizon
+        imagined = world_model.imagine_with_burn_in(
+            batch["observations"][:1, : burn_in + 1],
+            batch["action_types"][:1, :end],
+            batch["coords"][:1, :end],
+            batch["is_first"][:1, : burn_in + 1],
+            batch["rewards"][:1, : burn_in + 1],
+            burn_in=burn_in,
+            horizon=horizon,
+        )[0].argmax(dim=1)
+        target = world_model.preprocess(batch["observations"][0, burn_in:end])[:, -1]
 
     real_row = _row_of_frames([grid_to_image(f) for f in target])
     imagined_row = _row_of_frames([grid_to_image(f) for f in imagined])

@@ -21,13 +21,15 @@ class PolicyConfig:
     feature_dim: int = 288
     """Size of the world-model feature (rssm.deter_dim + rssm.stoch_dim)"""
     hidden_dim: int = 256
-    """Hidden width of the type/pointer/value MLPs"""
+    """Hidden width of the type/pointer MLPs"""
     num_action_types: int = NUM_ACTION_TYPES
     grid_size: int = GRID_SIZE
 
 
 class Policy(nn.Module):
-    """Actor-critic over world-model features with a factored action space.
+    """Actor over world-model features with a factored action space. The
+    critic (`model/critic.py`) is a separate module trained on this policy's
+    imagined rollouts, not part of `Policy` -- see `training/actor_critic.py`.
 
     The pointer head decodes a coarse 8x8 spatial seed up to a full
     grid_size x grid_size logit map (rather than one flat Linear to 4096),
@@ -45,7 +47,6 @@ class Policy(nn.Module):
             nn.Linear(c.hidden_dim, c.hidden_dim), nn.ELU(),
         )
         self.type_head = nn.Linear(c.hidden_dim, c.num_action_types)
-        self.value_head = nn.Linear(c.hidden_dim, 1)
 
         # pointer: hidden -> (32, 8, 8) seed, upsampled x2 per stage to
         # (1, grid_size, grid_size) logits.
@@ -68,7 +69,6 @@ class Policy(nn.Module):
         """features: (B, feature_dim). Returns:
         - type_logits: (B, num_action_types)
         - pointer_logits: (B, grid_size, grid_size), row y / column x
-        - value: (B,)
         """
         h = self.trunk(features)
         seed = self.pointer_fc(h).view(-1, 32, 8, 8)
@@ -76,7 +76,6 @@ class Policy(nn.Module):
         return {
             "type_logits": self.type_head(h),
             "pointer_logits": pointer_logits,
-            "value": self.value_head(h).squeeze(-1),
         }
 
     def act(
@@ -94,7 +93,7 @@ class Policy(nn.Module):
 
         Returns action_type (B,), coords (B, 2) int64 (x, y) -- only
         meaningful where action_type == ACTION6 -- plus log_prob (B,)
-        (joint over type and, for clicks, pointer) and value (B,).
+        (joint over type and, for clicks, pointer).
         """
         out = self.forward(features)
         type_logits = out["type_logits"]
@@ -118,7 +117,6 @@ class Policy(nn.Module):
             "action_type": action_type,
             "coords": coords,
             "log_prob": log_prob,
-            "value": out["value"],
         }
 
     def log_prob_entropy(
@@ -127,10 +125,10 @@ class Policy(nn.Module):
         action_type: Tensor,
         coords: Tensor,
         available_actions: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """Re-evaluate stored actions for policy-gradient training.
 
-        Returns (log_prob, entropy, value), each (B,). Entropy of the click
+        Returns (log_prob, entropy), each (B,). Entropy of the click
         pointer is only counted on ACTION6 steps, matching how `act` composes
         the joint log-prob.
         """
@@ -148,4 +146,4 @@ class Policy(nn.Module):
         is_click = (action_type == ACTION6).float()
         log_prob = type_dist.log_prob(action_type) + is_click * pointer_dist.log_prob(flat_idx)
         entropy = type_dist.entropy() + is_click * pointer_dist.entropy()
-        return log_prob, entropy, out["value"]
+        return log_prob, entropy

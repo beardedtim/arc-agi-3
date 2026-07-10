@@ -205,45 +205,66 @@ class WorldModel(nn.Module):
         coords: Tensor | None = None,
         is_first: Tensor | None = None,
         rewards: Tensor | None = None,
+        burn_in: int = 0,
     ) -> dict[str, Tensor]:
         """Run the RSSM over a batch of sequences with posterior teacher-forcing.
 
-        observations: (B, T, K, H, W) integer ARC-AGI-3 frame stacks at each
-            step t: the K most recent frames, oldest first, settled frame
-            last. When the API returns several animation frames for one
+        observations: (B, burn_in + T, K, H, W) integer ARC-AGI-3 frame stacks
+            at each step t: the K most recent frames, oldest first, settled
+            frame last. When the API returns several animation frames for one
             action they fill the stack; at episode start, replicate the
             first frame. K must equal config.frame_stack.
-        action_types: (B, T) int64, the action type that *produced*
+        action_types: (B, burn_in + T) int64, the action type that *produced*
             `observations[t]` (the buffer's prev_action-at-t convention),
             so step t's entry is exactly the prev_action of the RSSM
             transition that lands on step t.
-        coords: (B, T, 2) int64 click (x, y), consulted only where the type
-            is ACTION6 (see `encode_actions`). None if no clicks in batch.
-        is_first: (B, T) bool, True where step t is an episode's first frame.
-            Its placeholder action is zeroed rather than consumed -- no real
-            action produced an episode's first observation. None (e.g. a
-            caller without episode bookkeeping) skips the masking.
-        rewards: (B, T) or (B, T, 1) float, the reward that *produced*
-            `observations[t]` (same prev-action-at-t convention as
-            action_types) -- fed to the TaskEncoder alongside the completed
-            transition. None defaults to all zeros. Steps where is_first is
-            True are placeholders, zeroed the same way placeholder actions
-            are.
+        coords: (B, burn_in + T, 2) int64 click (x, y), consulted only where
+            the type is ACTION6 (see `encode_actions`). None if no clicks in
+            batch.
+        is_first: (B, burn_in + T) bool, True where step t is an episode's
+            first frame. Its placeholder action is zeroed rather than
+            consumed -- no real action produced an episode's first
+            observation. None (e.g. a caller without episode bookkeeping)
+            skips the masking.
+        rewards: (B, burn_in + T) or (B, burn_in + T, 1) float, the reward
+            that *produced* `observations[t]` (same prev-action-at-t
+            convention as action_types) -- fed to the TaskEncoder alongside
+            the completed transition. None defaults to all zeros. Steps
+            where is_first is True are placeholders, zeroed the same way
+            placeholder actions are.
+        burn_in: number of leading real steps consumed to build this
+            window's macro-context and warm the RSSM posterior state, but
+            not otherwise returned (see tickets/0004). The TaskEncoder is
+            stepped once per burn-in step (same as before this ticket) but
+            is never stepped again once the loss window starts: the
+            resulting macro-context is held frozen for the whole loss
+            window, matching what a dream sees (a frozen context from
+            `Thumper.dream`). `burn_in=0` skips the burn-in phase entirely,
+            so macro_context stays at its zero `initial_state` for the
+            whole window (there's no prefix to build it from) -- this is
+            the new code path's own well-defined base case, not a literal
+            reproduction of the pre-0004 per-step-stepping loop (which this
+            ticket removes; that was the root cause it fixes). Burn-in
+            steps compute no decoder output (pure waste -- nothing
+            downstream reads it).
 
-        Returns per-timestep (B, T, ...) tensors: prior_mean, prior_std,
-        post_mean, post_std, recon (per-cell symbol *logits*,
+        Returns per-timestep (B, T, ...) tensors -- note T, not burn_in + T,
+        the trailing loss window only: prior_mean, prior_std, post_mean,
+        post_std, recon (per-cell symbol *logits*,
         (B, T, num_symbols, grid_size, grid_size), decoded from the
-        posterior latent), and macro_context (the slow-memory belief used
-        to produce each step's outputs, see model/task_encoder.py).
+        posterior latent), and macro_context (the slow-memory belief, frozen
+        constant along the time axis when burn_in > 0, see
+        model/task_encoder.py).
         """
-        B, T = observations.shape[:2]
+        B, T_total = observations.shape[:2]
+        T = T_total - burn_in
         device = observations.device
         action_onehot = self.encode_actions(action_types, coords)
         if is_first is not None:
             action_onehot = action_onehot * (~is_first).unsqueeze(-1).float()
 
         if rewards is None:
-            rewards = torch.zeros(B, T, 1, dtype=torch.float, device=device)
+            rewards = torch.zeros(B, T_total, 1, dtype=torch.float, device=device)
         elif rewards.ndim == 2:
             rewards = rewards.unsqueeze(-1)
         if is_first is not None:
@@ -253,13 +274,34 @@ class WorldModel(nn.Module):
         macro_context = self.task_encoder.initial_state(B, device)
 
         # Encode every frame in one batched call: Vision has no cross-timestep
-        # dependency (unlike the RSSM step below), so folding B*T into one
-        # forward pass avoids T separate small kernel launches.
-        embeds = self.encode(observations.reshape(B * T, *observations.shape[2:])).reshape(B, T, -1)
+        # dependency (unlike the RSSM step below), so folding B*T_total into
+        # one forward pass avoids T_total separate small kernel launches.
+        embeds = self.encode(observations.reshape(B * T_total, *observations.shape[2:])).reshape(
+            B, T_total, -1
+        )
+
+        # Burn-in phase: step the posterior and the TaskEncoder to warm the
+        # RSSM state and build a real, nonzero macro-context, but store
+        # nothing and skip the decoder -- these steps aren't in the loss
+        # window.
+        for t in range(burn_in):
+            deter, _, _, stoch = self.rssm.step(deter, stoch, action_onehot[:, t], embeds[:, t], macro_context)
+            macro_context = self.task_encoder(
+                macro_context, deter.detach(), stoch.detach(), action_onehot[:, t], rewards[:, t]
+            )
+
+        # Boundary: detach the trunk so BPTT length through it stays exactly
+        # `T` (unchanged versus pre-0004), isolating this ticket's effect to
+        # the context change. macro_context is NOT detached -- the gradient
+        # path loss-window heads -> frozen m -> burn-in TaskEncoder steps is
+        # now the only way the TaskEncoder trains (its own inputs remain
+        # detached trunk tensors, as before).
+        deter = deter.detach()
+        stoch = stoch.detach()
 
         prior_means, prior_stds, post_means, post_stds, recons = [], [], [], [], []
         deters, stochs, macro_contexts = [], [], []
-        for t in range(T):
+        for t in range(burn_in, T_total):
             embed = embeds[:, t]
             deter, prior_stats, post_stats, stoch = self.rssm.step(
                 deter, stoch, action_onehot[:, t], embed, macro_context
@@ -277,13 +319,11 @@ class WorldModel(nn.Module):
             deters.append(deter)
             stochs.append(stoch)
             macro_contexts.append(macro_context)
-
-            # Fold in the completed transition (t) to build the context
-            # step t+1's outputs will see -- after storing m_t above, so
-            # rewards[:, t] never leaks into step t's own reward-head target.
-            macro_context = self.task_encoder(
-                macro_context, deter.detach(), stoch.detach(), action_onehot[:, t], rewards[:, t]
-            )
+            # macro_context is held frozen throughout the loss window --
+            # the TaskEncoder is never stepped here (see tickets/0004): the
+            # prior/posterior conditioning at training time must match what
+            # a dream sees, a constant context built from real transitions
+            # preceding the window.
 
         deter_seq = torch.stack(deters, dim=1)
         stoch_seq = torch.stack(stochs, dim=1)
@@ -296,7 +336,7 @@ class WorldModel(nn.Module):
             "recon": torch.stack(recons, dim=1),
             "deter": deter_seq,
             "stoch": stoch_seq,
-            "action_onehot": action_onehot,
+            "action_onehot": action_onehot[:, burn_in:],
             "macro_context": macro_context_seq,
         }
         outputs.update(self.predict_heads(self.features(deter_seq, stoch_seq, macro_context_seq)))
@@ -447,45 +487,82 @@ class WorldModel(nn.Module):
         return losses
 
     @torch.no_grad()
-    def imagine_from_first_frame(
-        self, first_observation: Tensor, action_types: Tensor, coords: Tensor | None = None
+    def imagine_with_burn_in(
+        self,
+        observations: Tensor,
+        action_types: Tensor,
+        coords: Tensor | None,
+        is_first: Tensor | None,
+        rewards: Tensor | None,
+        burn_in: int,
+        horizon: int,
     ) -> Tensor:
-        """Imagination rollout sanity check.
+        """Imagination rollout sanity check, burn-in variant (tickets/0004).
 
-        first_observation: (B, K, H, W) integer frame stack -- only the very
-            first real observation (at episode start, the first frame
-            replicated K times).
-        action_types: (B, T) int64 -- action sequence to imagine forward with, no
-            further real observations are used after t=0. `action_types[t]`
-            produces imagined frame t+1, so under the buffer's
-            prev_action-at-t convention a caller comparing against real
-            frames obs[0..T] must pass the buffer's actions[1..T] slice,
-            not actions[0..T-1].
-        coords: (B, T, 2) int64 click (x, y) for ACTION6 steps, or None.
+        observations: (B, burn_in + 1, K, H, W) real frame stacks -- the
+            burn-in prefix plus exactly one more real frame (the dream's
+            start state).
+        action_types: (B, burn_in + 1 + horizon) int64, buffer's
+            prev_action-at-t convention -- `action_types[burn_in + 1 + t]`
+            produces imagined frame t+1.
+        coords: (B, burn_in + 1 + horizon, 2) int64 click (x, y) for ACTION6
+            steps, or None.
+        is_first: (B, burn_in + 1) bool, or None -- same masking as
+            `forward_sequence`, applied only over the real (burn-in +
+            start-state) steps.
+        rewards: (B, burn_in + 1) float, or None -- same convention as
+            `forward_sequence`.
+        burn_in: real steps consumed (posterior + TaskEncoder) before the
+            start state.
+        horizon: imagined steps to roll forward after the start state.
 
         Returns decoded per-cell symbol logits
-        (B, T + 1, num_symbols, grid_size, grid_size): the real first frame's
-        posterior reconstruction, followed by T imagined frames. Argmax over
-        dim 2 recovers integer grids.
+        (B, horizon + 1, num_symbols, grid_size, grid_size): the last
+        burned-in frame's posterior reconstruction first, then `horizon`
+        imagined frames. Argmax over dim 1 recovers integer grids.
 
-        The macro-context belief m is initialized at t=0 and held frozen for
-        the whole rollout (the "imagination freeze rule"): game rules don't
-        change during a short latent dream, and stepping the TaskEncoder on
-        self-predicted (not real) transitions would corrupt task belief.
+        The macro-context belief m is built from the burn-in prefix and held
+        frozen for the whole imagined rollout (the "imagination freeze
+        rule", now consistent with training -- see tickets/0004): game rules
+        don't change during a short latent dream, and stepping the
+        TaskEncoder on self-predicted (not real) transitions would corrupt
+        task belief.
         """
-        B, T = action_types.shape
-        device = first_observation.device
+        B = observations.shape[0]
+        device = observations.device
         action_onehot = self.encode_actions(action_types, coords)
+        if is_first is not None:
+            # is_first only covers the burn-in + start-state real steps --
+            # the imagined-horizon actions that follow are never placeholders.
+            real_mask = (~is_first).unsqueeze(-1).float()
+            action_onehot = torch.cat(
+                [action_onehot[:, : burn_in + 1] * real_mask, action_onehot[:, burn_in + 1 :]], dim=1
+            )
+
+        if rewards is None:
+            rewards = torch.zeros(B, burn_in + 1, 1, dtype=torch.float, device=device)
+        elif rewards.ndim == 2:
+            rewards = rewards.unsqueeze(-1)
+        if is_first is not None:
+            rewards = rewards * (~is_first).unsqueeze(-1).float()
 
         deter, stoch = self.rssm.initial_state(B, device)
         macro_context = self.task_encoder.initial_state(B, device)
-        prev_action = torch.zeros(B, self.config.action_dim, device=device)
-        embed = self.encode(first_observation)
-        deter, stoch = self.rssm.observe_step(deter, stoch, prev_action, embed, macro_context)
+        embeds = self.encode(observations.reshape(B * (burn_in + 1), *observations.shape[2:])).reshape(
+            B, burn_in + 1, -1
+        )
+
+        for t in range(burn_in + 1):
+            deter, stoch = self.rssm.observe_step(deter, stoch, action_onehot[:, t], embeds[:, t], macro_context)
+            macro_context = self.task_encoder(
+                macro_context, deter.detach(), stoch.detach(), action_onehot[:, t], rewards[:, t]
+            )
 
         frames = [self.decoder(deter, stoch)]
-        for t in range(T):
-            deter, stoch = self.rssm.imagine_step(deter, stoch, action_onehot[:, t], macro_context)
+        for t in range(horizon):
+            deter, stoch = self.rssm.imagine_step(
+                deter, stoch, action_onehot[:, burn_in + 1 + t], macro_context
+            )
             frames.append(self.decoder(deter, stoch))
 
         return torch.stack(frames, dim=1)

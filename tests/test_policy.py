@@ -16,7 +16,6 @@ def test_forward_shapes(thumper):
     out = thumper.policy(_features(thumper, B))
     assert out["type_logits"].shape == (B, NUM_ACTION_TYPES)
     assert out["pointer_logits"].shape == (B, GRID, GRID)
-    assert out["value"].shape == (B,)
 
 
 def test_act_output_ranges(thumper):
@@ -50,9 +49,8 @@ def test_log_prob_entropy_matches_act(thumper):
     including the pointer term only on ACTION6 steps."""
     f = _features(thumper, 32)
     sampled = thumper.policy.act(f)
-    log_prob, entropy, value = thumper.policy.log_prob_entropy(
+    log_prob, entropy = thumper.policy.log_prob_entropy(
         f, sampled["action_type"], sampled["coords"]
     )
     assert torch.allclose(log_prob, sampled["log_prob"], atol=1e-5)
-    assert torch.allclose(value, sampled["value"], atol=1e-5)
     assert (entropy > 0).all()
