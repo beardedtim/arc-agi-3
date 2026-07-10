@@ -42,7 +42,6 @@ resume. A fresh Trainer resumes from them automatically when
 """
 import random
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,6 +53,8 @@ from env.env import Env, StepResult
 from model.actions import ACTION6, NUM_ACTION_TYPES, RESET
 from model.thumper import Thumper, ThumperConfig
 from training.actor_critic import ActorCriticConfig, ReturnNormalizer, actor_critic_losses
+from training.evaluate import EvalProtocol, evaluate
+from training.online_actor import OnlineActor
 from training.qualitative import save_imagination_check, save_recon_check
 from training.replay_buffer import Episode, ReplayBuffer
 
@@ -132,6 +133,17 @@ class TrainerConfig:
     imagine_horizon: int = 8
     """Imagined steps per imagination check; needs seq_len >= horizon + 1."""
 
+    # periodic in-training eval (tickets/0007); off by default -- a full
+    # sweep is 25 games x 5 episodes x 2 modes x <=600 steps ~= 150k env
+    # interactions, far too heavy for a frequent in-loop cadence. Enable
+    # deliberately with a small eval_games subset and/or
+    # eval_episodes_per_game=1.
+    eval_every: int = 0
+    """Env steps between in-training eval sweeps; 0 disables (the default)."""
+    eval_games: list[str] = field(default_factory=list)
+    """[] -> every downloaded game (Env.games())."""
+    eval_episodes_per_game: int = 1
+
     # checkpointing (in env steps; saves model+optimizer+counters+buffer)
     checkpoint_every: int = 5_000
     output_dir: str = "runs/world_model"
@@ -184,6 +196,7 @@ class Trainer:
             c.thumper = payload["config"]
 
         self.thumper = Thumper(c.thumper).to(c.device)
+        self.actor_state = OnlineActor(self.thumper, c.device)
         self.optimizer = torch.optim.Adam(self.thumper.world_model.parameters(), lr=c.lr)
         self.actor_optimizer = torch.optim.Adam(self.thumper.policy.parameters(), lr=c.actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.thumper.critic.parameters(), lr=c.critic_lr)
@@ -199,6 +212,7 @@ class Trainer:
         self.grad_steps = 0
         self.writer: SummaryWriter | None = None
         self._last_batch: dict[str, torch.Tensor] | None = None
+        self._eval_env: Env | None = None  # built lazily on first eval_every hook (own Env instance)
 
         if payload is not None:
             self.thumper.load_state_dict(payload["state_dict"])
@@ -289,53 +303,23 @@ class Trainer:
         self.buffer.add_step(
             episode, result.frame, RESET, (0, 0), 0.0, False, result.levels_completed / MAX_SCORE, mask
         )
-
-        wm = self.thumper.world_model
-        device = self.config.device
-        K = wm.config.frame_stack
-        self._frame_stack = deque([result.frame] * K, maxlen=K)
-        self._deter, self._stoch = wm.rssm.initial_state(1, device)
-        self._macro_context = wm.task_encoder.initial_state(1, device)
-        self._prev_action_onehot = torch.zeros(1, wm.config.action_dim, device=device)
+        self.actor_state.begin_episode(result.frame)
         return result, episode
 
-    @torch.no_grad()
     def _act(self, available_actions: list[int]) -> tuple[int, tuple[int, int], torch.Tensor]:
-        """One online step of the policy: observe the current frame stack,
-        step the RSSM posterior, and sample an action -- mirrors
-        forward_sequence's per-step ordering exactly (encode -> observe_step
-        -> act). Returns (action_type, coords, mask) so the caller can store
-        the mask the action was chosen under alongside the resulting step."""
-        wm = self.thumper.world_model
-        device = self.config.device
-        stack = torch.stack(list(self._frame_stack), dim=0).unsqueeze(0).to(device)
-        embed = wm.encode(stack)
-        self._deter, self._stoch = wm.rssm.observe_step(
-            self._deter, self._stoch, self._prev_action_onehot, embed, self._macro_context
-        )
-        mask = self._mask_from_available(available_actions)
-        out = self.thumper.act(self._deter, self._stoch, self._macro_context, mask.unsqueeze(0).to(device))
-        action_type = int(out["action_type"].item())
-        coords = tuple(out["coords"][0].tolist())
-        return action_type, coords, mask
+        """One online step of the policy -- delegates to the shared
+        OnlineActor (training/online_actor.py), the same acting loop the
+        evaluation harness uses."""
+        return self.actor_state.act(available_actions)
 
     def _step_latent(self, action_type: int, coords: tuple[int, int], reward: float, frame: torch.Tensor) -> None:
-        """Fold a completed real transition into the online latent state:
-        advance the frame stack and update macro_context (the TaskEncoder
-        *does* step online, on real transitions -- the imagination freeze
-        rule only applies to dreamed ones, see tickets/0003)."""
-        wm = self.thumper.world_model
-        device = self.config.device
-        action_type_t = torch.tensor([action_type], device=device)
-        coords_t = torch.tensor([coords], device=device)
-        action_onehot = wm.encode_actions(action_type_t, coords_t)
-        reward_t = torch.tensor([[reward]], device=device)
-        with torch.no_grad():
-            self._macro_context = wm.task_encoder(
-                self._macro_context, self._deter, self._stoch, action_onehot, reward_t
-            )
-        self._prev_action_onehot = action_onehot
-        self._frame_stack.append(frame)
+        """Fold a completed real transition into the online latent state --
+        delegates to the shared OnlineActor."""
+        self.actor_state.observe(action_type, coords, reward, frame)
+
+    @property
+    def _frame_stack(self):
+        return self.actor_state._frame_stack
 
     # --- training ----------------------------------------------------------
 
@@ -520,6 +504,7 @@ class Trainer:
             episode_return = 0.0
             episode_len = 0
             last_checkpoint_env_steps = self.env_steps
+            last_eval_env_steps = self.env_steps
             env_steps_at_last_grad = self.env_steps
             window_start = time.monotonic()
             window_grad_steps = 0
@@ -571,7 +556,7 @@ class Trainer:
                             self.env_steps,
                         )
                     self.writer.add_scalar(
-                        "online/macro_context_norm", self._macro_context.norm().item(), self.env_steps
+                        "online/macro_context_norm", self.actor_state.macro_context_norm, self.env_steps
                     )
                 if terminated:
                     game = self._current_game
@@ -650,6 +635,11 @@ class Trainer:
                         f"(grad_steps={self.grad_steps}, buffer={self.buffer.total_steps})"
                     )
 
+                # --- optional periodic eval sweep on its own env-step cadence
+                if c.eval_every > 0 and self.env_steps - last_eval_env_steps >= c.eval_every:
+                    last_eval_env_steps = self.env_steps
+                    self._run_eval_hook()
+
             self.save_checkpoint()
             print(
                 f"Done: env_steps={self.env_steps}, grad_steps={self.grad_steps}. "
@@ -658,6 +648,44 @@ class Trainer:
         finally:
             self.writer.close()
             self.writer = None
+
+    # --- periodic in-training eval -------------------------------------------
+
+    def _run_eval_hook(self) -> None:
+        """Run an eval sweep against the live weights at this env-step count
+        and log eval/* scalars. Must not perturb training: uses its own Env
+        (the collector's is mid-episode) and its own OnlineActor, and
+        save/restores torch/random RNG state around the call so enabling
+        eval doesn't fork an otherwise-identical run's trajectory (the
+        collector's action sampling and the buffer's random.choice sampling
+        both depend on process-global RNG state)."""
+        c = self.config
+        if self._eval_env is None:
+            self._eval_env = Env()
+
+        torch_rng_state = torch.get_rng_state()
+        python_rng_state = random.getstate()
+        try:
+            protocol = EvalProtocol(
+                games=c.eval_games or None,
+                episodes_per_game=c.eval_episodes_per_game,
+                max_steps=c.timeout_env_steps,
+            )
+            report = evaluate(self.thumper, self._eval_env, protocol)
+        finally:
+            torch.set_rng_state(torch_rng_state)
+            random.setstate(python_rng_state)
+
+        if self.writer is None:
+            return
+        for mode in protocol.modes:
+            stats_by_game = report.per_game(mode)
+            for game, stats in stats_by_game.items():
+                self.writer.add_scalar(f"eval/{mode}/score/{game}", stats.mean_levels_completed, self.env_steps)
+                self.writer.add_scalar(f"eval/{mode}/win/{game}", stats.win_rate, self.env_steps)
+                self.writer.add_scalar(f"eval/{mode}/len/{game}", stats.mean_length, self.env_steps)
+            self.writer.add_scalar(f"eval/{mode}/games_scored", report.games_scored(mode), self.env_steps)
+            self.writer.add_scalar(f"eval/{mode}/games_won", report.games_won(mode), self.env_steps)
 
     # --- checkpointing -------------------------------------------------------
 
