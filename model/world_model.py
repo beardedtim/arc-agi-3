@@ -12,6 +12,7 @@ from torch import Tensor, nn
 
 from model.actions import ACTION6, GRID_SIZE, NUM_ACTION_TYPES, NUM_SYMBOLS, PAD_SYMBOL
 from model.rssm import RSSM, ImageDecoder, ImageDecoderConfig, RSSMConfig
+from model.task_encoder import TaskEncoder, TaskEncoderConfig
 from model.vision import Vision, VisionConfig
 
 
@@ -75,6 +76,7 @@ class WorldModelConfig:
     vision: VisionConfig = field(default_factory=VisionConfig)
     rssm: RSSMConfig = field(default_factory=RSSMConfig)
     ensemble: EnsembleConfig = field(default_factory=EnsembleConfig)
+    task_encoder: TaskEncoderConfig = field(default_factory=TaskEncoderConfig)
 
     @property
     def action_dim(self) -> int:
@@ -92,6 +94,7 @@ class WorldModelConfig:
         # sized for the grid/vocabulary `preprocess` actually feeds it.
         self.rssm.embed_dim = self.vision.out_dim
         self.rssm.action_dim = self.action_dim
+        self.rssm.macro_context_dim = self.task_encoder.context_dim
         self.vision.input_size = self.grid_size
         self.vision.num_symbols = self.num_symbols
         self.vision.frame_stack = self.frame_stack
@@ -112,34 +115,44 @@ class WorldModel(nn.Module):
                 out_size=c.grid_size,
             )
         )
-        # Dreamer heads on the RSSM latent (deter ++ stoch). All three train
-        # alongside the reconstruction/KL objective whenever batch targets are
-        # passed to compute_losses; imagination-time actor-critic reads the
-        # reward and continue heads (continue outputs a *logit*).
-        feature_dim = c.rssm.deter_dim + c.rssm.stoch_dim
+        # Slow memory: folds completed (deter, stoch, action, reward)
+        # transitions into a macro-context belief about the current game's
+        # rules -- see model/task_encoder.py.
+        self.task_encoder = TaskEncoder(
+            c.task_encoder, deter_dim=c.rssm.deter_dim, stoch_dim=c.rssm.stoch_dim, action_dim=c.action_dim
+        )
+        # Dreamer heads on the RSSM latent (deter ++ stoch ++ macro_context).
+        # All three train alongside the reconstruction/KL objective whenever
+        # batch targets are passed to compute_losses; imagination-time
+        # actor-critic reads the reward and continue heads (continue outputs
+        # a *logit*).
+        feature_dim = c.rssm.deter_dim + c.rssm.stoch_dim + c.task_encoder.context_dim
         self.reward_head = _mlp_head(feature_dim, c.head_hidden_dim, 1)
         self.continue_head = _mlp_head(feature_dim, c.head_hidden_dim, 1)
         self.internal_state_head = _mlp_head(feature_dim, c.head_hidden_dim, c.internal_state_dim)
         # Disagreement ensemble: rides the same batches, reads
         # the latent without shaping it -- see compute_losses' detach.
-        self.ensemble = TransitionEnsemble(c.rssm.deter_dim, c.rssm.stoch_dim, c.action_dim, c.ensemble)
+        self.ensemble = TransitionEnsemble(
+            c.rssm.deter_dim, c.rssm.stoch_dim, c.action_dim, c.task_encoder.context_dim, c.ensemble
+        )
 
-    def features(self, deter: Tensor, stoch: Tensor) -> Tensor:
-        return torch.cat([deter, stoch], dim=-1)
+    def features(self, deter: Tensor, stoch: Tensor, macro_context: Tensor) -> Tensor:
+        return torch.cat([deter, stoch, macro_context], dim=-1)
 
     def predict_heads(self, features: Tensor) -> dict[str, Tensor]:
-        """features: (..., deter_dim + stoch_dim). Returns reward (...,),
-        continue_logit (...,), internal_state (..., internal_state_dim)."""
+        """features: (..., deter_dim + stoch_dim + macro_context_dim).
+        Returns reward (...,), continue_logit (...,), internal_state
+        (..., internal_state_dim)."""
         return {
             "reward": self.reward_head(features).squeeze(-1),
             "continue_logit": self.continue_head(features).squeeze(-1),
             "internal_state": self.internal_state_head(features),
         }
 
-    def disagreement(self, deter: Tensor, stoch: Tensor, action: Tensor) -> Tensor:
+    def disagreement(self, deter: Tensor, stoch: Tensor, action: Tensor, macro_context: Tensor) -> Tensor:
         """(..., dim) -> (...,) variance across the ensemble's K predicted
         next-stoch means."""
-        return self.ensemble.disagreement(deter, stoch, action)
+        return self.ensemble.disagreement(deter, stoch, action, macro_context)
 
     def preprocess(self, grids: Tensor) -> Tensor:
         """(..., H, W) integer cell values -> (..., grid_size, grid_size)
@@ -191,6 +204,7 @@ class WorldModel(nn.Module):
         action_types: Tensor,
         coords: Tensor | None = None,
         is_first: Tensor | None = None,
+        rewards: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Run the RSSM over a batch of sequences with posterior teacher-forcing.
 
@@ -209,11 +223,18 @@ class WorldModel(nn.Module):
             Its placeholder action is zeroed rather than consumed -- no real
             action produced an episode's first observation. None (e.g. a
             caller without episode bookkeeping) skips the masking.
+        rewards: (B, T) or (B, T, 1) float, the reward that *produced*
+            `observations[t]` (same prev-action-at-t convention as
+            action_types) -- fed to the TaskEncoder alongside the completed
+            transition. None defaults to all zeros. Steps where is_first is
+            True are placeholders, zeroed the same way placeholder actions
+            are.
 
         Returns per-timestep (B, T, ...) tensors: prior_mean, prior_std,
         post_mean, post_std, recon (per-cell symbol *logits*,
         (B, T, num_symbols, grid_size, grid_size), decoded from the
-        posterior latent).
+        posterior latent), and macro_context (the slow-memory belief used
+        to produce each step's outputs, see model/task_encoder.py).
         """
         B, T = observations.shape[:2]
         device = observations.device
@@ -221,7 +242,15 @@ class WorldModel(nn.Module):
         if is_first is not None:
             action_onehot = action_onehot * (~is_first).unsqueeze(-1).float()
 
+        if rewards is None:
+            rewards = torch.zeros(B, T, 1, dtype=torch.float, device=device)
+        elif rewards.ndim == 2:
+            rewards = rewards.unsqueeze(-1)
+        if is_first is not None:
+            rewards = rewards * (~is_first).unsqueeze(-1).float()
+
         deter, stoch = self.rssm.initial_state(B, device)
+        macro_context = self.task_encoder.initial_state(B, device)
 
         # Encode every frame in one batched call: Vision has no cross-timestep
         # dependency (unlike the RSSM step below), so folding B*T into one
@@ -229,11 +258,11 @@ class WorldModel(nn.Module):
         embeds = self.encode(observations.reshape(B * T, *observations.shape[2:])).reshape(B, T, -1)
 
         prior_means, prior_stds, post_means, post_stds, recons = [], [], [], [], []
-        deters, stochs = [], []
+        deters, stochs, macro_contexts = [], [], []
         for t in range(T):
             embed = embeds[:, t]
             deter, prior_stats, post_stats, stoch = self.rssm.step(
-                deter, stoch, action_onehot[:, t], embed
+                deter, stoch, action_onehot[:, t], embed, macro_context
             )
 
             prior_mean, prior_std = RSSM.dist_params(prior_stats)
@@ -247,9 +276,18 @@ class WorldModel(nn.Module):
             recons.append(recon)
             deters.append(deter)
             stochs.append(stoch)
+            macro_contexts.append(macro_context)
+
+            # Fold in the completed transition (t) to build the context
+            # step t+1's outputs will see -- after storing m_t above, so
+            # rewards[:, t] never leaks into step t's own reward-head target.
+            macro_context = self.task_encoder(
+                macro_context, deter.detach(), stoch.detach(), action_onehot[:, t], rewards[:, t]
+            )
 
         deter_seq = torch.stack(deters, dim=1)
         stoch_seq = torch.stack(stochs, dim=1)
+        macro_context_seq = torch.stack(macro_contexts, dim=1)
         outputs = {
             "prior_mean": torch.stack(prior_means, dim=1),
             "prior_std": torch.stack(prior_stds, dim=1),
@@ -259,8 +297,9 @@ class WorldModel(nn.Module):
             "deter": deter_seq,
             "stoch": stoch_seq,
             "action_onehot": action_onehot,
+            "macro_context": macro_context_seq,
         }
-        outputs.update(self.predict_heads(self.features(deter_seq, stoch_seq)))
+        outputs.update(self.predict_heads(self.features(deter_seq, stoch_seq, macro_context_seq)))
         return outputs
 
     def compute_losses(
@@ -353,13 +392,17 @@ class WorldModel(nn.Module):
         # prev_action the RSSM consumed to land on step t+1. Both the
         # (deter, stoch) input and the post_mean target are detached: the
         # ensemble reads the trunk's latent without shaping it, so this
-        # loss is zero-risk to recon/KL.
+        # loss is zero-risk to recon/KL. macro_context is taken at t+1 too
+        # (built from transitions up to t, the same belief the RSSM prior
+        # sees when producing step t+1) -- not t, which would leak nothing
+        # extra but misalign with what the prior actually conditioned on.
         if T > 1:
             deter_in = outputs["deter"][:, :-1].detach()
             stoch_in = outputs["stoch"][:, :-1].detach()
             action_in = outputs["action_onehot"][:, 1:]
+            macro_context_in = outputs["macro_context"][:, 1:].detach()
             target = outputs["post_mean"][:, 1:].detach()
-            preds = self.ensemble(deter_in, stoch_in, action_in)  # (K, B, T-1, stoch_dim)
+            preds = self.ensemble(deter_in, stoch_in, action_in, macro_context_in)  # (K, B, T-1, stoch_dim)
             per_step_mse = (preds - target.unsqueeze(0)).pow(2).mean(dim=-1)  # (K, B, T-1)
 
             if batch is not None:
@@ -424,19 +467,25 @@ class WorldModel(nn.Module):
         (B, T + 1, num_symbols, grid_size, grid_size): the real first frame's
         posterior reconstruction, followed by T imagined frames. Argmax over
         dim 2 recovers integer grids.
+
+        The macro-context belief m is initialized at t=0 and held frozen for
+        the whole rollout (the "imagination freeze rule"): game rules don't
+        change during a short latent dream, and stepping the TaskEncoder on
+        self-predicted (not real) transitions would corrupt task belief.
         """
         B, T = action_types.shape
         device = first_observation.device
         action_onehot = self.encode_actions(action_types, coords)
 
         deter, stoch = self.rssm.initial_state(B, device)
+        macro_context = self.task_encoder.initial_state(B, device)
         prev_action = torch.zeros(B, self.config.action_dim, device=device)
         embed = self.encode(first_observation)
-        deter, stoch = self.rssm.observe_step(deter, stoch, prev_action, embed)
+        deter, stoch = self.rssm.observe_step(deter, stoch, prev_action, embed, macro_context)
 
         frames = [self.decoder(deter, stoch)]
         for t in range(T):
-            deter, stoch = self.rssm.imagine_step(deter, stoch, action_onehot[:, t])
+            deter, stoch = self.rssm.imagine_step(deter, stoch, action_onehot[:, t], macro_context)
             frames.append(self.decoder(deter, stoch))
 
         return torch.stack(frames, dim=1)
@@ -453,12 +502,15 @@ def _mlp_head(in_dim: int, hidden_dim: int, out_dim: int) -> nn.Sequential:
 class TransitionEnsemble(nn.Module):
     """Plan2Explore-style disagreement ensemble (Sekar et al. 2020): K
     independently initialized MLP heads, each predicting the next posterior
-    stoch *mean* from (deter, stoch, action) at the current step. Variance
-    across heads at a state-action is the intrinsic "what don't I know yet"
-    signal -- high on game mechanics the agent hasn't tried yet (an
-    unclicked object, an unexplored room), low on mastered ones. That is
-    the exploration currency ARC-AGI-3 demands: no instructions, so the
-    agent has to seek out the transitions it can't yet predict.
+    stoch *mean* from (deter, stoch, action, macro_context) at the current
+    step. Variance across heads at a state-action is the intrinsic "what
+    don't I know yet" signal -- high on game mechanics the agent hasn't
+    tried yet (an unclicked object, an unexplored room), low on mastered
+    ones. That is the exploration currency ARC-AGI-3 demands: no
+    instructions, so the agent has to seek out the transitions it can't yet
+    predict. Conditioning on macro_context lets disagreement be
+    task-relative: what's "known" can differ per belief about which game's
+    rules are in play.
 
     The K heads share one `_mlp_head`-shaped architecture (2 hidden ELU
     layers) but batch their weights into single (K, ...) parameter tensors
@@ -467,11 +519,18 @@ class TransitionEnsemble(nn.Module):
     K separate kernel launches.
     """
 
-    def __init__(self, deter_dim: int, stoch_dim: int, action_dim: int, config: EnsembleConfig | None = None):
+    def __init__(
+        self,
+        deter_dim: int,
+        stoch_dim: int,
+        action_dim: int,
+        macro_context_dim: int,
+        config: EnsembleConfig | None = None,
+    ):
         super().__init__()
         self.config = config or EnsembleConfig()
         k = self.config.ensemble_size
-        in_dim = deter_dim + stoch_dim + action_dim
+        in_dim = deter_dim + stoch_dim + action_dim + macro_context_dim
         hidden_dim = self.config.ensemble_hidden_dim
         self.stoch_dim = stoch_dim
         self.k = k
@@ -495,20 +554,20 @@ class TransitionEnsemble(nn.Module):
         restored = {name.replace("__", "."): params[name] for name in self._param_names}
         return torch.func.functional_call(self._template, restored, (x,))
 
-    def forward(self, deter: Tensor, stoch: Tensor, action: Tensor) -> Tensor:
-        """deter/stoch/action: (..., dim). Returns (K, ..., stoch_dim), each
-        head's predicted next posterior stoch mean."""
-        x = torch.cat([deter, stoch, action], dim=-1)
+    def forward(self, deter: Tensor, stoch: Tensor, action: Tensor, macro_context: Tensor) -> Tensor:
+        """deter/stoch/action/macro_context: (..., dim). Returns
+        (K, ..., stoch_dim), each head's predicted next posterior stoch mean."""
+        x = torch.cat([deter, stoch, action, macro_context], dim=-1)
         flat_x = x.reshape(-1, x.shape[-1])
         params = {name: self.params[name] for name in self._param_names}
         preds = torch.vmap(self._functional_forward, in_dims=(0, None))(params, flat_x)
         return preds.reshape(self.k, *x.shape[:-1], self.stoch_dim)
 
-    def disagreement(self, deter: Tensor, stoch: Tensor, action: Tensor) -> Tensor:
+    def disagreement(self, deter: Tensor, stoch: Tensor, action: Tensor, macro_context: Tensor) -> Tensor:
         """Variance across the K heads' predicted means, averaged over stoch
         dims -- one scalar per state-action. no_grad-safe for imagination
         use."""
-        preds = self.forward(deter, stoch, action)
+        preds = self.forward(deter, stoch, action, macro_context)
         return preds.var(dim=0, unbiased=False).mean(dim=-1)
 
 

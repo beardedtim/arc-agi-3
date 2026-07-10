@@ -99,6 +99,7 @@ def save_recon_check(
             batch["action_types"][:1, :num_frames],
             batch["coords"][:1, :num_frames],
             batch["is_first"][:1, :num_frames],
+            rewards=batch["rewards"][:1, :num_frames],
         )
         # Only each stack's last (settled) frame is reconstructed -- compare
         # against exactly that.

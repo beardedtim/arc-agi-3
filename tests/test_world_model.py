@@ -57,12 +57,15 @@ class TestForwardSequence:
         wm = thumper.world_model
         B, T = obs_batch.shape[:2]
         types = torch.randint(0, NUM_ACTION_TYPES, (B, T))
-        out = wm.forward_sequence(obs_batch, types)
+        rewards = torch.randn(B, T)
+        out = wm.forward_sequence(obs_batch, types, rewards=rewards)
         stoch = wm.config.rssm.stoch_dim
+        context_dim = wm.config.task_encoder.context_dim
         assert out["post_mean"].shape == (B, T, stoch)
         assert out["prior_std"].shape == (B, T, stoch)
         assert out["recon"].shape == (B, T, wm.config.num_symbols, GRID, GRID)
         assert out["deter"].shape == (B, T, wm.config.rssm.deter_dim)
+        assert out["macro_context"].shape == (B, T, context_dim)
         assert out["reward"].shape == (B, T)
         assert out["continue_logit"].shape == (B, T)
         assert out["internal_state"].shape == (B, T, 1)
@@ -76,6 +79,18 @@ class TestForwardSequence:
         out = wm.forward_sequence(obs_batch, types, is_first=is_first)
         assert (out["action_onehot"][:, 0] == 0).all()
         assert (out["action_onehot"][:, 1:].sum(-1) == 1).all()
+
+    def test_rewards_default_to_zero(self, thumper, obs_batch):
+        """No rewards passed -> TaskEncoder folds in all-zero rewards, same
+        as an explicit all-zero tensor."""
+        wm = thumper.world_model
+        B, T = obs_batch.shape[:2]
+        types = torch.full((B, T), ACTION1)
+        torch.manual_seed(3)
+        out_default = wm.forward_sequence(obs_batch, types)
+        torch.manual_seed(3)
+        out_explicit = wm.forward_sequence(obs_batch, types, rewards=torch.zeros(B, T))
+        assert torch.allclose(out_default["macro_context"], out_explicit["macro_context"])
 
 
 class TestComputeLosses:
@@ -143,6 +158,32 @@ class TestImagination:
         grids = frames.argmax(dim=2)
         assert grids.min() >= 0 and grids.max() < wm.config.num_symbols
 
+    def test_imagine_from_first_frame_needs_no_rewards(self, thumper):
+        """imagine_from_first_frame takes no reward argument at all -- it
+        must run without one, and the macro_context passed to every imagined
+        step must be the same (frozen) tensor."""
+        wm = thumper.world_model
+        B, T = 2, 4
+        first = torch.randint(0, 16, (B, STACK, GRID, GRID))
+        types = torch.randint(0, NUM_ACTION_TYPES, (B, T))
+
+        seen_contexts = []
+        original_imagine_step = wm.rssm.imagine_step
+
+        def spy(prev_deter, prev_stoch, prev_action, macro_context):
+            seen_contexts.append(macro_context)
+            return original_imagine_step(prev_deter, prev_stoch, prev_action, macro_context)
+
+        wm.rssm.imagine_step = spy
+        try:
+            wm.imagine_from_first_frame(first, types)
+        finally:
+            wm.rssm.imagine_step = original_imagine_step
+
+        assert len(seen_contexts) == T
+        for ctx in seen_contexts[1:]:
+            assert torch.equal(ctx, seen_contexts[0])
+
 
 class TestEnsemble:
     def test_forward_and_disagreement_shapes(self, thumper):
@@ -152,12 +193,50 @@ class TestEnsemble:
         deter = torch.randn(B, c.rssm.deter_dim)
         stoch = torch.randn(B, c.rssm.stoch_dim)
         action = torch.randn(B, c.action_dim)
-        preds = wm.ensemble(deter, stoch, action)
+        macro_context = torch.randn(B, c.task_encoder.context_dim)
+        preds = wm.ensemble(deter, stoch, action, macro_context)
         assert preds.shape == (c.ensemble.ensemble_size, B, c.rssm.stoch_dim)
-        dis = wm.disagreement(deter, stoch, action)
+        dis = wm.disagreement(deter, stoch, action, macro_context)
         assert dis.shape == (B,)
         # independently initialized heads must actually disagree
         assert (dis > 0).all()
+
+
+class TestGradientIsolation:
+    def test_ensemble_loss_does_not_train_task_encoder(self, thumper, obs_batch):
+        """ensemble_loss reads macro_context detached -- backward from it
+        alone must leave task_encoder with no grad."""
+        wm = thumper.world_model
+        B, T = obs_batch.shape[:2]
+        types = torch.randint(0, NUM_ACTION_TYPES, (B, T))
+        rewards = torch.randn(B, T)
+        wm.zero_grad()
+        out = wm.forward_sequence(obs_batch, types, rewards=rewards)
+        losses = wm.compute_losses(out, obs_batch)
+        losses["ensemble_loss"].backward()
+        for p in wm.task_encoder.parameters():
+            assert p.grad is None or p.grad.abs().sum() == 0
+        wm.zero_grad()
+
+    def test_task_encoder_path_does_not_perturb_trunk_grad(self, thumper, obs_batch):
+        """The TaskEncoder consumes detached (deter, stoch): a loss that
+        only flows through the TaskEncoder's output (macro_context) must
+        leave the RSSM trunk (GRU/prior/posterior) with zero grad from that
+        backward pass, since detach() cuts the path back into the trunk."""
+        wm = thumper.world_model
+        B, T = obs_batch.shape[:2]
+        types = torch.randint(0, NUM_ACTION_TYPES, (B, T))
+        rewards = torch.randn(B, T)
+        wm.zero_grad()
+        out = wm.forward_sequence(obs_batch, types, rewards=rewards)
+        # A loss purely on macro_context (the TaskEncoder's output).
+        macro_context_loss = out["macro_context"].pow(2).mean()
+        macro_context_loss.backward()
+        for name in ("gru", "prior_head", "posterior_head"):
+            module = getattr(wm.rssm, name)
+            for p in module.parameters():
+                assert p.grad is None or p.grad.abs().sum() == 0
+        wm.zero_grad()
 
 
 def test_kl_divergence_zero_for_identical_gaussians():

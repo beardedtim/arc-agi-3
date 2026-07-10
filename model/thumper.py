@@ -33,7 +33,11 @@ class ThumperConfig:
         # the policy reads the world model's latent (deter ++ stoch), so its
         # feature width is derived here rather than trusted to agree by hand.
         # The two must also share one picture of the action space.
-        self.policy.feature_dim = self.world_model.rssm.deter_dim + self.world_model.rssm.stoch_dim
+        self.policy.feature_dim = (
+            self.world_model.rssm.deter_dim
+            + self.world_model.rssm.stoch_dim
+            + self.world_model.task_encoder.context_dim
+        )
         self.policy.num_action_types = self.world_model.num_action_types
         self.policy.grid_size = self.world_model.grid_size
 
@@ -56,25 +60,30 @@ class Thumper(nn.Module):
         self.world_model = WorldModel(self.config.world_model)
         self.policy = Policy(self.config.policy)
 
-    def features(self, deter: torch.Tensor, stoch: torch.Tensor) -> torch.Tensor:
-        """The (deter ++ stoch) latent both the heads and the policy read."""
-        return self.world_model.features(deter, stoch)
+    def features(
+        self, deter: torch.Tensor, stoch: torch.Tensor, macro_context: torch.Tensor
+    ) -> torch.Tensor:
+        """The (deter ++ stoch ++ macro_context) latent both the heads and
+        the policy read."""
+        return self.world_model.features(deter, stoch, macro_context)
 
     @torch.no_grad()
     def act(
         self,
         deter: torch.Tensor,
         stoch: torch.Tensor,
+        macro_context: torch.Tensor,
         available_actions: torch.Tensor | None = None,
         greedy: bool = False,
     ) -> dict[str, torch.Tensor]:
         """Convenience: latent state -> sampled ARC-AGI-3 action.
 
         The caller owns the RSSM state loop (encode the frame stack, step the
-        RSSM, pass (deter, stoch) here); this just bridges world model
-        features into the policy. See Policy.act for the return dict.
+        RSSM, pass (deter, stoch, macro_context) here); this just bridges
+        world model features into the policy. See Policy.act for the return
+        dict.
         """
-        return self.policy.act(self.features(deter, stoch), available_actions, greedy)
+        return self.policy.act(self.features(deter, stoch, macro_context), available_actions, greedy)
 
     def parameter_counts(self) -> dict[str, int]:
         """Trainable parameter count per top-level component, plus 'total'.

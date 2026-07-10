@@ -10,11 +10,12 @@ def test_config_wiring():
     """The __post_init__ hooks must keep cross-component dims agreeing."""
     cfg = small_config()
     wm, pol = cfg.world_model, cfg.policy
-    assert pol.feature_dim == wm.rssm.deter_dim + wm.rssm.stoch_dim
+    assert pol.feature_dim == wm.rssm.deter_dim + wm.rssm.stoch_dim + wm.task_encoder.context_dim
     assert pol.num_action_types == wm.num_action_types
     assert pol.grid_size == wm.grid_size
     assert wm.rssm.embed_dim == wm.vision.out_dim
     assert wm.rssm.action_dim == wm.action_dim
+    assert wm.rssm.macro_context_dim == wm.task_encoder.context_dim
     assert wm.vision.input_size == wm.grid_size
     assert wm.vision.frame_stack == wm.frame_stack
 
@@ -26,8 +27,10 @@ def test_default_config_builds():
 def test_act_bridges_latent_to_action(thumper):
     B = 4
     c = thumper.config.world_model.rssm
+    context_dim = thumper.config.world_model.task_encoder.context_dim
     deter, stoch = torch.randn(B, c.deter_dim), torch.randn(B, c.stoch_dim)
-    out = thumper.act(deter, stoch)
+    macro_context = torch.randn(B, context_dim)
+    out = thumper.act(deter, stoch, macro_context)
     assert set(out) == {"action_type", "coords", "log_prob", "value"}
     assert out["action_type"].shape == (B,)
 
@@ -53,8 +56,10 @@ def test_save_load_roundtrip(thumper, tmp_path):
         assert torch.equal(p1, p2)
     # loaded model produces identical latent features
     c = thumper.config.world_model.rssm
+    context_dim = thumper.config.world_model.task_encoder.context_dim
     deter, stoch = torch.randn(2, c.deter_dim), torch.randn(2, c.stoch_dim)
-    a = thumper.act(deter, stoch, greedy=True)
-    b = loaded.act(deter, stoch, greedy=True)
+    macro_context = torch.randn(2, context_dim)
+    a = thumper.act(deter, stoch, macro_context, greedy=True)
+    b = loaded.act(deter, stoch, macro_context, greedy=True)
     assert (a["action_type"] == b["action_type"]).all()
     assert (a["coords"] == b["coords"]).all()

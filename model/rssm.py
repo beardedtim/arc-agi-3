@@ -27,6 +27,11 @@ class RSSMConfig:
     """Size of the deterministic recurrent state (the GRU's hidden state)"""
     stoch_dim: int = 32
     """Size of the stochastic latent state sampled from the prior/posterior"""
+    macro_context_dim: int = 128
+    """Size of the slow-memory macro-context vector (m) the TaskEncoder
+    produces; must match `TaskEncoderConfig.context_dim` -- wired in
+    `WorldModelConfig.__post_init__`. Conditions the prior/posterior heads
+    only, not the GRU's deterministic recurrence."""
 
 
 class RSSM(nn.Module):
@@ -38,14 +43,16 @@ class RSSM(nn.Module):
 
         self.gru = nn.GRUCell(cfg.stoch_dim + cfg.action_dim, cfg.deter_dim)
 
-        # prior: predict stoch from deter alone (used when imagining, no obs)
+        # prior: predict stoch from deter + macro-context (used when
+        # imagining, no obs)
         self.prior_head = nn.Sequential(
-            nn.Linear(cfg.deter_dim, cfg.deter_dim), nn.ReLU(),
+            nn.Linear(cfg.deter_dim + cfg.macro_context_dim, cfg.deter_dim), nn.ReLU(),
             nn.Linear(cfg.deter_dim, 2 * cfg.stoch_dim),
         )
-        # posterior: predict stoch from deter + real observation embedding
+        # posterior: predict stoch from deter + real observation embedding +
+        # macro-context
         self.posterior_head = nn.Sequential(
-            nn.Linear(cfg.deter_dim + cfg.embed_dim, cfg.deter_dim), nn.ReLU(),
+            nn.Linear(cfg.deter_dim + cfg.embed_dim + cfg.macro_context_dim, cfg.deter_dim), nn.ReLU(),
             nn.Linear(cfg.deter_dim, 2 * cfg.stoch_dim),
         )
 
@@ -65,23 +72,37 @@ class RSSM(nn.Module):
         return mean, std
 
     def observe_step(
-        self, prev_deter: Tensor, prev_stoch: Tensor, prev_action: Tensor, embed: Tensor
+        self,
+        prev_deter: Tensor,
+        prev_stoch: Tensor,
+        prev_action: Tensor,
+        embed: Tensor,
+        macro_context: Tensor,
     ) -> tuple[Tensor, Tensor]:
         """One posterior step: fold in a real observation embedding."""
         deter = self.gru(torch.cat([prev_stoch, prev_action], dim=-1), prev_deter)
-        stoch = self._sample(self.posterior_head(torch.cat([deter, embed], dim=-1)))
+        stoch = self._sample(self.posterior_head(torch.cat([deter, embed, macro_context], dim=-1)))
         return deter, stoch
 
     def imagine_step(
-        self, prev_deter: Tensor, prev_stoch: Tensor, prev_action: Tensor
+        self,
+        prev_deter: Tensor,
+        prev_stoch: Tensor,
+        prev_action: Tensor,
+        macro_context: Tensor,
     ) -> tuple[Tensor, Tensor]:
         """One prior step: predict forward with no observation (imagination)."""
         deter = self.gru(torch.cat([prev_stoch, prev_action], dim=-1), prev_deter)
-        stoch = self._sample(self.prior_head(deter))
+        stoch = self._sample(self.prior_head(torch.cat([deter, macro_context], dim=-1)))
         return deter, stoch
 
     def step(
-        self, prev_deter: Tensor, prev_stoch: Tensor, prev_action: Tensor, embed: Tensor
+        self,
+        prev_deter: Tensor,
+        prev_stoch: Tensor,
+        prev_action: Tensor,
+        embed: Tensor,
+        macro_context: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """One training step: shares a single `deter` between the prior (no
         observation) and posterior (with observation) heads, so the KL term
@@ -90,8 +111,8 @@ class RSSM(nn.Module):
         Returns (deter, prior_stats, posterior_stats, posterior_stoch).
         """
         deter = self.gru(torch.cat([prev_stoch, prev_action], dim=-1), prev_deter)
-        prior_stats = self.prior_head(deter)
-        posterior_stats = self.posterior_head(torch.cat([deter, embed], dim=-1))
+        prior_stats = self.prior_head(torch.cat([deter, macro_context], dim=-1))
+        posterior_stats = self.posterior_head(torch.cat([deter, embed, macro_context], dim=-1))
         posterior_stoch = self._sample(posterior_stats)
         return deter, prior_stats, posterior_stats, posterior_stoch
 

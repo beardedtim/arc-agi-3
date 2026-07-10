@@ -129,4 +129,85 @@ Open questions this run should inform (not gate on):
 
 ## Findings
 
-_Pending — run not yet launched._
+**Success.** Ran to completion (100k env steps, 49,500/49,500 grad steps,
+~1h wall-clock at ~27 env steps/s / ~13.4 grad steps/s). Every pre-registered
+"Good" criterion was met; no "Bad" or "Ugly" triggers fired.
+
+- `loss/recon` fell hard and cleanly, ~0.134 → ~0.0075 with no plateau. The
+  final recon samples are near pixel-perfect — playfield, HUD, sprites, even
+  the click-cursor highlight — and checkpoints span visually distinct games,
+  confirming one shared latent handles all 25.
+- **Imagination works**: late `imagine_step_*.png` rows track ground truth
+  across most of the 8-step horizon; artifacts appear only at discrete
+  transition frames (e.g. a piece landing), then recover. The prior learned
+  real multi-step dynamics, not just single-frame compression.
+- No numeric issues: `train/grad_norm` settled 2.1 → 0.49 (one early spike
+  to 84, well under the clip); losses moved immediately from step 1.
+- Ensemble healthy: `wm/ensemble_loss` 0.38 → 0.12 while
+  `disagreement_mean` stayed meaningfully above zero (~0.009, p90 ~0.02) —
+  the exploration currency exists and is non-degenerate.
+- `loss/reward` / `loss/continue` near zero and quiet, as expected under
+  random play; no game had a nonzero win rate.
+
+Two observations worth carrying forward (neither a blocker):
+
+1. **`kl_raw` (~0.07) sits well *below* the 1.0 free-nats floor**, so the KL
+   term is fully clamped and inert. This is the benign case — recon kept
+   improving, so posterior ≈ prior because the prior itself got good — but it
+   means `kl_weight` currently does nothing. Revisit when tickets/0002's
+   macro-context conditioning changes the prior/posterior heads; there is
+   headroom for the context to absorb task identity without fighting the KL.
+2. **Episode length is pinned at the 600-step cap on 24 of 25 games** (only
+   `sp80` terminates naturally, ~250 steps). Random play essentially never
+   finishes an episode, so the continue head sees almost no "done" signal and
+   buffer composition is uniform-by-construction. This is exactly the
+   motivation for the exploration work in tickets/0002, not a reason to
+   change it.
+
+Decision: baseline validated; proceed with tickets/0002 as written.
+
+---
+
+# Smoke check — tickets/0002 macro-context plumbing (July 9, 2026)
+
+Not a full run: a 3k-env-step / 1,250-grad-step smoke check after implementing
+tickets/0002 (Hierarchical Slow-Fast Memory / `TaskEncoder`), to satisfy its
+acceptance criterion 4 ("no regression vs Run 1") before committing to a full
+100k-step run under the new architecture. Run 1's `runs/world_model/latest.pt`
+is not loadable against the widened model (new `task_encoder.*` params, wider
+RSSM/head/ensemble inputs — see tickets/0002's checkpoint-compatibility note),
+so this used a fresh `--config.output-dir` and trained from scratch.
+
+```sh
+uv run python train.py \
+  --config.output-dir runs/smoke_0002 \
+  --config.total-env-steps 3000 \
+  --config.prefill-steps 500 \
+  --config.log-every 25 \
+  --config.qualitative-every 100000 \  # skip image checks, this is a scalar-only smoke test
+  --config.imagine-every 100000 \
+  --config.checkpoint-every 100000
+```
+
+## What to Look for
+
+Only one criterion: `loss/recon` should fall from the start, same shape as
+Run 1's early trajectory — the macro-context conditioning should be at worst
+neutral for reconstruction this early. Not judging KL, reward, imagination,
+or disagreement quality at this budget (too short to mean anything); that's
+what the next full run is for.
+
+## Findings
+
+**Pass.** `loss/recon` fell cleanly and monotonically-ish from 2.87 (grad
+step 1) to ~0.06-0.09 by grad step 1,250, no plateau, no NaN/inf, no shape
+errors — the `TaskEncoder`/macro-context plumbing (RSSM prior/posterior
+conditioning, widened heads, ensemble, `WorldModel.features`) works
+end-to-end through the real online loop across 5 games (ar25, bp35, cd82,
+cn04, dc22). `train/grad_norm` stayed bounded throughout. Deleted
+`runs/smoke_0002` after the check (scalars only, not worth keeping).
+
+Decision: proceed to a full tickets/0002 run under a fresh `--config.output-dir`
+(e.g. `runs/world_model_v2`) using Run 1's defaults, and compare its
+`loss/recon` trajectory and final qualitative samples against Run 1's as the
+real regression check.

@@ -233,7 +233,11 @@ class Trainer:
 
         wm = self.thumper.world_model
         outputs = wm.forward_sequence(
-            batch["observations"], batch["action_types"], batch["coords"], batch["is_first"]
+            batch["observations"],
+            batch["action_types"],
+            batch["coords"],
+            batch["is_first"],
+            rewards=batch["rewards"],
         )
         losses = wm.compute_losses(
             outputs, batch["observations"], batch=batch, kl_weight=self.kl_weight()
@@ -278,7 +282,10 @@ class Trainer:
         if outputs["deter"].shape[1] > 1:
             with torch.no_grad():
                 disagreement = self.thumper.world_model.disagreement(
-                    outputs["deter"][:, :-1], outputs["stoch"][:, :-1], outputs["action_onehot"][:, 1:]
+                    outputs["deter"][:, :-1],
+                    outputs["stoch"][:, :-1],
+                    outputs["action_onehot"][:, 1:],
+                    outputs["macro_context"][:, 1:],
                 )
                 flat = disagreement.reshape(-1)
                 w.add_scalar("wm/disagreement_mean", flat.mean().item(), step)
