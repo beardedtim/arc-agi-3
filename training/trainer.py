@@ -452,6 +452,7 @@ class Trainer:
         w.add_scalar("policy/extrinsic_reward_mean", metrics["extrinsic_mean"], step)
         w.add_scalar("policy/value_ext_mean", metrics["value_ext_mean"], step)
         w.add_scalar("policy/value_int_mean", metrics["value_int_mean"], step)
+        w.add_scalar("policy/dream_score_sum", metrics["dream_score_sum"], step)
         w.add_scalar("policy/return_norm_scale_ext", self.return_normalizer_ext.scale, step)
         w.add_scalar("policy/return_norm_scale_int", self.return_normalizer_int.scale, step)
         w.add_scalar("policy/grad_norm_actor", metrics["grad_norm_actor"], step)

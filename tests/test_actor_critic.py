@@ -250,7 +250,12 @@ class TestActorCriticLosses:
         with torch.no_grad():
             target_values = thumper.critic_target(dream["features"])
         discounts = ActorCriticConfig().gamma * dream["continue_prob"]
-        expected_ext = lambda_returns(dream["reward"], discounts, target_values[..., 0], ActorCriticConfig().return_lambda)
+        # tickets/0006: the extrinsic stream's discounts absorb at the
+        # predicted score (here just the reward tensor itself, which is
+        # exactly what dream["reward"] is set to above).
+        absorb = 1.0 - dream["reward"].clamp(0.0, 1.0)
+        discounts_ext = discounts * absorb
+        expected_ext = lambda_returns(dream["reward"], discounts_ext, target_values[..., 0], ActorCriticConfig().return_lambda)
         expected_int = lambda_returns(dream["intrinsic"], discounts, target_values[..., 1], ActorCriticConfig().return_lambda)
 
         normalizer_ext = ReturnNormalizer()
@@ -315,3 +320,161 @@ class TestActorCriticLosses:
         )
         assert torch.allclose(losses_a["actor_loss"], losses_b["actor_loss"], atol=1e-6)
         assert losses_a["imagined_return_ext"].item() == losses_b["imagined_return_ext"].item()
+
+
+class TestAbsorbingScoreExtrinsicReturns:
+    """tickets/0006: a predicted score is absorbing for the extrinsic
+    lambda-return only -- one dream can bank at most ~one score."""
+
+    def test_absorption_math_hand_computed(self):
+        # N=1, H=6, continue_prob == 1 (discounts == gamma), rewards +1 at
+        # steps 2 and 5. Absorption at step 2 must zero the discount chain
+        # for every step after it, so step 5's reward and the tail bootstrap
+        # beyond step 2 contribute exactly zero to returns[0..2].
+        gamma = 0.9
+        H = 6
+        rewards = torch.zeros(1, H)
+        rewards[0, 2] = 1.0
+        rewards[0, 5] = 1.0
+        continue_prob = torch.ones(1, H)
+        discounts = gamma * continue_prob
+        absorb = 1.0 - rewards.clamp(0.0, 1.0)
+        discounts_ext = discounts * absorb
+        values = torch.full((1, H + 1), 3.0)  # arbitrary nonzero bootstrap
+        lam = 0.95
+
+        got = lambda_returns(rewards, discounts_ext, values, lam)
+
+        # Steps 3, 4, 5 discount from step 2 is zero -- so returns[2] is
+        # just the reward at step 2, full stop.
+        assert torch.allclose(got[0, 2], torch.tensor(1.0), atol=1e-6)
+        # returns[3] and returns[4] can't see the step-5 reward either,
+        # since discounts_ext[3] and discounts_ext[4] are the pre-absorption
+        # gamma (no score has happened yet *at* step 3/4) -- but discounts_ext[2]
+        # is what's zeroed, cutting returns[0..1]'s view of anything beyond
+        # step 2's own reward.
+        # returns[1] should equal r1 + d1 * ((1-lam)*v2 + lam*returns[2])
+        # with r1 = 0, d1 = gamma (absorb[1] = 1, no score at step 1).
+        expected_1 = 0.0 + gamma * ((1 - lam) * values[0, 2] + lam * got[0, 2])
+        assert torch.allclose(got[0, 1], expected_1, atol=1e-6)
+        expected_0 = 0.0 + gamma * ((1 - lam) * values[0, 1] + lam * got[0, 1])
+        assert torch.allclose(got[0, 0], expected_0, atol=1e-6)
+
+    def test_inflation_loop_break(self):
+        # The ticket's reason to exist: an absurdly inflated bootstrap value
+        # must not leak past an absorbing score. +1 reward at step 0,
+        # continue_prob == 1, target values pinned to 100 everywhere.
+        H = 4
+        rewards = torch.zeros(1, H)
+        rewards[0, 0] = 1.0
+        continue_prob = torch.ones(1, H)
+        discounts = 0.997 * continue_prob
+        absorb = 1.0 - rewards.clamp(0.0, 1.0)
+        discounts_ext = discounts * absorb
+        values = torch.full((1, H + 1), 100.0)
+
+        got = lambda_returns(rewards, discounts_ext, values, 0.95)
+        assert torch.allclose(got[0, 0], torch.tensor(1.0), atol=1e-6)
+
+    def test_no_score_neutrality(self, thumper):
+        # With dream["reward"] all zero, R_ext must be bit-identical to
+        # lambda_returns computed with the unmodified (pre-fix) discounts.
+        deter, stoch, macro_context, mask = _start_states(thumper, 3)
+        dream = thumper.dream(deter, stoch, macro_context, mask, horizon=4)
+        dream = dict(dream)
+        dream["reward"] = torch.zeros_like(dream["reward"])
+
+        cfg = ActorCriticConfig()
+        discounts = cfg.gamma * dream["continue_prob"]
+        with torch.no_grad():
+            target_values = thumper.critic_target(dream["features"])
+        expected = lambda_returns(dream["reward"], discounts, target_values[..., 0], cfg.return_lambda)
+
+        losses = actor_critic_losses(
+            dream, thumper.policy, thumper.critic, thumper.critic_target,
+            ReturnNormalizer(), ReturnNormalizer(), cfg,
+        )
+        assert torch.allclose(losses["imagined_return_ext"], expected.mean(), atol=1e-6)
+
+    def test_negative_rewards_do_not_absorb(self):
+        # A level loss (-1) is clamped to 0 by clamp(r, 0, 1), so it must
+        # leave the extrinsic discount chain untouched at that step.
+        rewards = torch.tensor([[0.0, -1.0, 0.0]])
+        absorb = 1.0 - rewards.clamp(0.0, 1.0)
+        assert torch.equal(absorb, torch.ones_like(rewards))
+
+    def test_intrinsic_stream_isolation(self, thumper):
+        """R_int and the intrinsic advantage must be bit-identical whatever
+        the extrinsic rewards are -- absorption must not touch the
+        intrinsic discount chain (extends 0005's drowning regression test)."""
+        deter, stoch, macro_context, mask = _start_states(thumper, 4)
+        dream = thumper.dream(deter, stoch, macro_context, mask, horizon=3)
+        dream_a = dict(dream)
+        dream_a["reward"] = torch.zeros_like(dream["reward"])
+        dream_b = dict(dream)
+        dream_b["reward"] = torch.ones_like(dream["reward"])  # score every step
+
+        cfg = ActorCriticConfig()
+        with torch.no_grad():
+            target_values = thumper.critic_target(dream["features"])
+        discounts = cfg.gamma * dream["continue_prob"]
+        returns_int_a = lambda_returns(
+            dream_a["intrinsic"], discounts, target_values[..., 1], cfg.return_lambda
+        )
+        returns_int_b = lambda_returns(
+            dream_b["intrinsic"], discounts, target_values[..., 1], cfg.return_lambda
+        )
+        assert torch.equal(returns_int_a, returns_int_b)
+
+        losses_a = actor_critic_losses(
+            dream_a, thumper.policy, thumper.critic, thumper.critic_target,
+            ReturnNormalizer(), ReturnNormalizer(), cfg,
+        )
+        losses_b = actor_critic_losses(
+            dream_b, thumper.policy, thumper.critic, thumper.critic_target,
+            ReturnNormalizer(), ReturnNormalizer(), cfg,
+        )
+        assert torch.allclose(losses_a["imagined_return_int"], losses_b["imagined_return_int"], atol=1e-6)
+
+    def test_no_new_grad_path_into_reward_head(self, thumper):
+        """actor_loss/critic_loss.backward() must still leave the world
+        model's reward head grad-free -- the absorb factor is computed from
+        a grad-free dream tensor, so no new gradient path opens."""
+        deter, stoch, macro_context, mask = _start_states(thumper, 3)
+        dream = thumper.dream(deter, stoch, macro_context, mask, horizon=3)
+        cfg = ActorCriticConfig()
+        normalizer_ext = ReturnNormalizer()
+        normalizer_int = ReturnNormalizer()
+
+        losses = actor_critic_losses(
+            dream, thumper.policy, thumper.critic, thumper.critic_target, normalizer_ext, normalizer_int, cfg
+        )
+        thumper.zero_grad()
+        losses["actor_loss"].backward(retain_graph=True)
+        for p in thumper.world_model.reward_head.parameters():
+            assert p.grad is None or p.grad.abs().sum() == 0
+
+        thumper.zero_grad()
+        losses = actor_critic_losses(
+            dream, thumper.policy, thumper.critic, thumper.critic_target, normalizer_ext, normalizer_int, cfg
+        )
+        losses["critic_loss"].backward()
+        for p in thumper.world_model.reward_head.parameters():
+            assert p.grad is None or p.grad.abs().sum() == 0
+        thumper.zero_grad()
+
+    def test_dream_score_sum_metric(self, thumper):
+        deter, stoch, macro_context, mask = _start_states(thumper, 3)
+        dream = thumper.dream(deter, stoch, macro_context, mask, horizon=3)
+        dream = dict(dream)
+        reward = torch.zeros_like(dream["reward"])
+        reward[:, 0] = 1.0
+        reward[:, 1] = 2.0  # clamped to 1
+        dream["reward"] = reward
+
+        cfg = ActorCriticConfig()
+        losses = actor_critic_losses(
+            dream, thumper.policy, thumper.critic, thumper.critic_target,
+            ReturnNormalizer(), ReturnNormalizer(), cfg,
+        )
+        assert torch.allclose(losses["dream_score_sum"], torch.tensor(2.0), atol=1e-6)

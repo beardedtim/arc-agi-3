@@ -12,6 +12,12 @@ Two-stream returns (tickets/0005): extrinsic (reward) and intrinsic
 bootstrap, and `ReturnNormalizer` -- see `actor_critic_losses`. Splitting
 them stops the (continuous, ~10x larger) intrinsic stream from drowning the
 (sparse, O(1)) extrinsic stream inside one shared normalizer.
+
+Absorbing-score extrinsic returns (tickets/0006): a predicted score is
+absorbing for the extrinsic stream only -- once a dream banks one, the
+discount chain for everything after it is multiplied toward zero, so a
+single dream can claim at most ~one level completion's worth of extrinsic
+return, matching what the real environment actually pays.
 """
 from dataclasses import dataclass
 
@@ -103,16 +109,28 @@ def actor_critic_losses(
     two *normalized* advantages -- this is what keeps a sparse +1 level
     completion visible against a continuous stream of exploration payment
     (see tickets/0005's Design principle 1).
+
+    Absorbing scores (tickets/0006): the extrinsic stream's discount chain
+    is multiplied by `(1 - clamp(reward, 0, 1))`, so a predicted score
+    absorbs all extrinsic credit after it -- the intrinsic stream's
+    discounts are untouched.
     """
     features = dream["features"]  # (N, H+1, feature_dim)
     N, H = dream["action_types"].shape
 
     discounts = cfg.gamma * dream["continue_prob"]
 
+    # tickets/0006: a predicted score is absorbing for extrinsic credit --
+    # one dream can bank at most ~one score. `dream["reward"]` is grad-free
+    # by construction (Thumper.dream runs under no_grad), so this opens no
+    # new gradient path into the reward head.
+    absorb = 1.0 - dream["reward"].clamp(0.0, 1.0)
+    discounts_ext = discounts * absorb
+
     with torch.no_grad():
         target_values = critic_target(features)  # (N, H+1, 2)
     returns_ext = lambda_returns(
-        dream["reward"], discounts, target_values[..., 0], cfg.return_lambda
+        dream["reward"], discounts_ext, target_values[..., 0], cfg.return_lambda
     )  # (N, H)
     returns_int = lambda_returns(
         dream["intrinsic"], discounts, target_values[..., 1], cfg.return_lambda
@@ -150,4 +168,5 @@ def actor_critic_losses(
         "extrinsic_mean": dream["reward"].mean().detach(),
         "value_ext_mean": values[..., 0].mean().detach(),
         "value_int_mean": values[..., 1].mean().detach(),
+        "dream_score_sum": dream["reward"].clamp(0.0, 1.0).sum(dim=1).mean().detach(),
     }

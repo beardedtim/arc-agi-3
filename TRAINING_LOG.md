@@ -781,4 +781,185 @@ Decision this run should produce — one of three exits, pre-committed:
 
 ## Findings
 
-_Pending — fill in after the run._
+(Filled in mid-run, July 10, at ~47k/100k env steps / ~23k grad steps —
+per the conventions, a stopped run with an answered question beats a
+finished one. **Recommendation: stop here.** The run answered its question
+as pre-committed exit 2 — wiring confirmed, behavior not yet changed — and
+surfaced the "Ugly" ext-critic destabilization in a slow-motion form; the
+remaining ~2.5h would deepen a diagnosed pathology, not add information.
+Fix is tickets/0006; resume this same output dir after it lands.)
+
+**Wiring: the entire Good-#1 causal chain through step 3 fired, in order.**
+
+- (1) Intrinsic-driven play scored: lp85 at env ~44.2k, sp80 at ~45.5k —
+  2 scoring episodes of 104 completed (Run 3's incidental rate; step 4 not
+  yet judgeable, ~10 episodes after the first event).
+- (2) `train/reward_windows_in_batch` went 0 → 4 at grad step 21,438,
+  within ~200 grad steps of the first scoring episode completing, and held
+  at 4/16 — the stratified sampler hits its 25% target from 2 distinct
+  events. The pre-registered "sampler can't find real events" Ugly did not
+  fire.
+- (3) The ext stream moved: `return_norm_scale_ext` 0.11 → 5.35,
+  `imagined_return_ext`/`value_ext_mean` off ~0.03 together. Int stream
+  stayed clean throughout (isolation working as designed).
+
+**But step 3 kept going — the pre-registered Ugly, in slow motion.** Over
+~2k grad steps after first contact, `policy/value_ext_mean` climbed 0.03 →
+1.6 (peak 2.55), still rising monotonically at assessment; ext critic loss
+spiked to 2.86 (700× baseline, grad_norm_critic to 11), settling ~10×
+elevated; dream `extrinsic_reward_mean` reached ~0.03/step — **~1,000× the
+real reward rate** (2 events in 47k steps). With `gamma=0.997` that
+supports v ≈ 10; nothing bounded the climb.
+
+**Checkpoint probes pinned the mechanism as world-model exploitation —
+the actor farms the reward head in imagination:**
+
+- 15-step dreams from reward-window starts collect mean **1.63** predicted
+  extrinsic reward per dream (p90 3.2, max 4.3) vs the +1 a real level
+  completion pays *once*; 11% of dream steps claim r > 0.5. Uniform-random
+  dream actions from the same starts get 0.007 — the policy specifically
+  learned re-triggering sequences. `loss/reward` on real data is fine
+  (~1.5e-5); the head over-predicts only on imagined, policy-steered
+  states no real data anchors (the model has seen 2 scoring transitions
+  ever and can't know a completion consumes itself).
+- Critic decoupled from reality everywhere: v_ext ≈ 6.2 at reward-window
+  starts (true ≈ 1), ≈ 0.56 at uniform starts (true ≈ 0.001) — the
+  bootstrap/target-sync loop feeding itself.
+- **Disagreement does not flag the farmed states** (corr ≈ −0.01; equal
+  disagreement at claimed-reward steps vs elsewhere) — an uncertainty
+  penalty on dream reward would not bite; tested before being rejected in
+  tickets/0006's non-goals.
+
+**Everything else is healthy** — this is an objective bug, not a model
+one: recon flat-good ~0.008–0.010 (≈ Run 3's final; not improving further,
+same extend-before-tuning clause), samples sharp, imagination holds the
+horizon, `kl_raw` ~0.04, `disagreement_mean` ~0.004 with per-game
+structure (no self-consumption collapse), grad_norm ~0.2, no NaN/inf.
+Entropy: one early dip (min 0.36 at grad ~1.3k) self-recovered to ~3,
+then eased to 1.9–2.4 as ext advantages arrived — the <0.3-sustained
+trigger never fired, no action-type frac above 0.28. New since the ext
+wake-up: many games' episodes now end early (deaths at 45–150 steps on
+~10 games vs Run 1's everything-at-cap), so the continue head finally has
+real terminals.
+
+The probe (rerun it against the post-0006 checkpoint per that ticket's
+acceptance criterion 3 — per-dream ext λ-credit should be bounded ≈ ≤ 1):
+
+```sh
+PYTHONPATH=. uv run python - <<'EOF'
+import torch
+from model.thumper import Thumper
+from training.replay_buffer import ReplayBuffer
+
+torch.manual_seed(0)
+th = Thumper.load("runs/two_stream_returns/latest.pt"); th.eval()
+wm = th.world_model
+buf = ReplayBuffer.load("runs/two_stream_returns/buffer.pt",
+                        frame_stack=wm.config.frame_stack,
+                        internal_state_dim=wm.config.internal_state_dim)
+BURN, SEQ, H = 16, 16, 15
+for name, frac in [("uniform starts", 0.0), ("reward-window starts", 1.0)]:
+    b = buf.sample(16, BURN + SEQ, reward_frac=frac, loss_offset=BURN)
+    with torch.no_grad():
+        out = wm.forward_sequence(b["observations"], b["action_types"], b["coords"],
+                                  b["is_first"], rewards=b["rewards"], burn_in=BURN)
+        N = 16 * SEQ
+        d = th.dream(out["deter"].reshape(N, -1), out["stoch"].reshape(N, -1),
+                     out["macro_context"].reshape(N, -1),
+                     b["available_actions"][:, BURN:].reshape(N, -1), horizon=H)
+        vals = th.critic(d["features"])
+    r, dis = d["reward"], d["intrinsic"]
+    print(f"== {name} ==")
+    print(f"  dream ext reward: mean/step={r.mean():.4f} per-dream sum mean={r.sum(1).mean():.3f} "
+          f"p90={r.sum(1).quantile(0.9):.3f} max={r.sum(1).max():.3f}")
+    print(f"  v_ext: t0 mean={vals[:, 0, 0].mean():.3f} max={vals[..., 0].max():.3f}")
+    print(f"  corr(reward, disagreement)={torch.corrcoef(torch.stack([r.flatten(), dis.flatten()]))[0, 1]:.3f}")
+EOF
+```
+
+Decision: exit 2, sharpened — the bottleneck moved past normalization not
+to credit assignment but to **unbounded extrinsic returns in imagination**
+(reward farming). tickets/0006 makes predicted scores absorbing for the
+extrinsic λ-return (one dream banks at most ~one score, bounding critic
+targets and deleting the farming incentive). No parameter shapes change;
+Run 6 resumes this output dir, keeping the buffer's scoring events.
+
+---
+
+# Run 6 — tickets/0006 absorbing-score extrinsic returns (July 10, 2026)
+
+Direct continuation of Run 5's diagnosis: the wiring (tickets/0005) and the
+world model are both healthy, but the actor's extrinsic objective inside
+imagination was an unbounded sum of a reward the environment pays at most
+once per level, and it learned to farm the reward head for it. tickets/0006
+makes a predicted score absorbing for the extrinsic λ-return only — the
+discount chain past a claimed score is multiplied by `(1 - clamp(reward, 0,
+1))`, so a single dream can bank at most ~one score's worth of extrinsic
+credit. No parameter shapes change, so this **resumes `runs/two_stream_returns`
+in place** rather than a fresh output dir: the buffer's 2 real scoring
+episodes (lp85, sp80) and ~47k steps of on-policy data are the only signal
+this fix has to work with, and `--init-from` would discard them along with
+the warm world model.
+
+```sh
+# Same output dir as Run 5 (deliberate resume) -- no new flags, since the
+# fix is entirely inside actor_critic_losses and carries no config surface.
+uv run python train.py \
+  --config.output-dir runs/two_stream_returns \
+  --config.init-from runs/burn_in_fix/latest.pt \
+  --config.total-env-steps 100000
+```
+
+## What to Look for
+
+`uv run tensorboard --logdir runs/two_stream_returns/tb`. Grad steps here
+continue Run 5's numbering (~23k at the point Run 5 was assessed and this
+fix applied); "early" below means the few hundred grad steps immediately
+after resume.
+
+**Good:**
+
+- `policy/value_ext_mean` falls from ~1.6 (Run 5's peak) back under ~1
+  within a few hundred grad steps — the poisoned critic deflating now that
+  its regression targets are bounded.
+- `policy/return_norm_scale_ext` decays from ~5.35 as the return spread
+  shrinks back toward O(1).
+- `policy/dream_score_sum` (new metric, this ticket) settles and holds
+  under 1 — the direct farming gauge; Run 5's checkpoint measured ~1.6 mean
+  / 4.3 max from reward-window starts.
+- ext critic loss comes back down off its ~10×-elevated plateau toward
+  baseline (~4e-3 territory, per Run 5's pre-spike numbers).
+- The actual behavioral question, carried over from Run 5: scoring recurs
+  on lp85/sp80/cd82 more than incidentally now that the farming incentive
+  is gone and the extrinsic advantage stays a clean, bounded signal.
+- Everything Run 5 already had healthy stays healthy: recon ~0.009, sharp
+  imagination samples, `wm/disagreement_mean` alive (~0.004), entropy
+  holding 1.9–2.4, no NaN/inf.
+
+**Bad:**
+
+- `dream_score_sum` falls under 1 but scoring frequency in real play does
+  *not* recover from Run 5's incidental rate (2/104 episodes) — would mean
+  absorption fixed the imagination pathology but the actor still isn't
+  learning a *useful* scoring policy from the bounded signal (a credit-
+  assignment or exploration problem, not this ticket's problem to solve).
+- `value_ext_mean` deflates but overshoots negative or oscillates instead
+  of settling — would suggest the critic's regression targets are still
+  noisy at this data volume (2 real events) regardless of the bound.
+
+**Ugly:**
+
+- `dream_score_sum` does not fall under 1, or the ext critic/return-scale
+  metrics don't move from Run 5's inflated plateau at all — would mean the
+  absorbing factor isn't reaching the extrinsic lambda-return as wired
+  (implementation bug, re-check `actor_critic_losses` against tickets/0006
+  before re-running).
+- New instability appears in the *intrinsic* stream (`value_int_mean`,
+  `return_norm_scale_int` moving off their Run 5 baselines) — would mean
+  the fix leaked into the intrinsic discount chain despite the isolation
+  tests (tickets/0006's Step 4 test 5) passing in unit tests but not
+  covering some interaction the full run exposes.
+
+## Findings
+
+(fill in after / during the run)
