@@ -152,7 +152,9 @@ Open questions this run should inform (not gate on):
 Two observations worth carrying forward (neither a blocker):
 
 1. **`kl_raw` (~0.07) sits well _below_ the 1.0 free-nats floor**, so the KL
-   term is fully clamped and inert. This is the benign case — recon kept
+   term is fully clamped and inert. *[Correction, July 10 — see Run 6
+   Findings: the floor is per-dim, 1/32 ≈ 0.031, so 0.07 is above it and
+   the KL term was active.]* This is the benign case — recon kept
    improving, so posterior ≈ prior because the prior itself got good — but it
    means `kl_weight` currently does nothing. Revisit when tickets/0002's
    macro-context conditioning changes the prior/posterior heads; there is
@@ -435,8 +437,9 @@ fix.)
   half its steps. One single-batch transient at grad step 10,067 (recon 3.1,
   grad_norm 59) recovered immediately; no NaN/inf anywhere.
 - **`kl_raw` did *not* rise back toward Run 1's level** — the opposite:
-  ~0.05 flat vs Run 1's ~0.13→0.07 (Run 3 ends at 0.034). Both sit far
-  below the 1.0 free-nats floor, so the KL term stays inert either way. The
+  ~0.05 flat vs Run 1's ~0.13→0.07 (Run 3 ends at 0.034). *[Correction,
+  July 10 — see Run 6 Findings: the floor is per-dim ≈ 0.031, so these
+  values hover at/above it and the KL term was active, not inert.]* The
   expected-recovery prediction was wrong, but the dreams prove the low KL is
   now honest prior competence rather than the Run 2 crutch. No retuning, per
   the ticket's non-goals.
@@ -1039,7 +1042,81 @@ under the fix, which only the Run 6 resume produces.
 
 ## Findings
 
-Run completed at env_steps=100000 (grad_steps=46000). See `runs/two_stream_returns/eval_100000_prefix.json` / `eval_100000_postfix.json` for the raw per-episode data behind the tables below.
+Run completed at env_steps=100000, grad_steps=49500 (checkpoint counters;
+Run 6's span is the ~26.5k grad steps after the ~23k resume point). See
+`runs/two_stream_returns/eval_100000_prefix.json` /
+`eval_100000_postfix.json` for the raw per-episode data behind the tables
+below.
+
+**Verdict: the pre-registered Good column, near-verbatim.** The absorbing
+discount deflated the poisoned extrinsic stream and held it bounded for
+26k grad steps of continued training; no Bad or Ugly trigger fired.
+
+- **Ext stream deflated cleanly.** One brief resume transient
+  (`value_ext_mean` 1.27 → 3.28 and `return_norm_scale_ext` to 9.8 within
+  the first ~1k grad steps — the old critic's inflated targets flushing
+  through the new bounded objective) then monotone decay: `value_ext_mean`
+  0.98 at 26k → 0.36–0.48 tail, `return_norm_scale_ext` 4.08 → 0.79. No
+  negative overshoot, no oscillation — pre-registered Bad #2 did not fire.
+  `policy/critic_loss` came off Run 5's elevated plateau back to
+  ~5e-3–1.3e-2.
+- **`dream_score_sum` (the direct farming gauge) never re-crossed 1**
+  after the resume transient: range ~0.01–0.67 across the span, tail mean
+  0.23, final 0.12 — vs Run 5's checkpoint measuring 1.63 mean / 4.3 max
+  per dream.
+- **Criterion 3 (the R_ext probe) passes on a critic *trained* under the
+  fix** — the half the Run 5 sanity-run explicitly couldn't show. From
+  reward-window starts: absorbing `R_ext` t0 mean 0.737 / max **1.003**
+  (uniform starts: 0.384 / 0.990). The same dreams under the pre-fix
+  discount give 1.10 mean / 6.27 max, and raw per-dream reward *sums*
+  still reach 7.3 — the reward head can still imagine re-triggering
+  sequences, but the λ-return now pays for at most one of them. That is
+  exactly the designed bound: the incentive is deleted downstream of the
+  head, not papered over by retraining it.
+- **World model untouched, as designed:** recon ~0.0064, `loss/reward`
+  ~4e-6 on real data, `disagreement_mean` alive at 0.002–0.0065 with
+  per-game structure, `kl_raw` 0.026–0.066 (see the units correction
+  below — this straddles the true per-dim floor of ~0.031, so the KL term
+  is active, not inert), final recon/imagination samples sharp with
+  rollouts holding the full horizon.
+- **Behavior: real scoring recurred, modestly.** In Run 6's span: cd82
+  scored in 3 of 7 collection episodes (0 in all of Run 5), lp85 3 of 5
+  (1 in Run 5), sp80 0 of 5 (down from Run 5's 1 — though the final
+  checkpoint scores 1.00 on sp80 at eval in both modes, so this is
+  small-sample collection noise, not a lost skill). Zero wins anywhere,
+  still. So pre-registered Bad #1 half-fired: absorption fixed the
+  imagination pathology and scoring now recurs *above* the incidental
+  rate on 2 of 3 games, but nothing yet looks like a policy that seeks
+  levels. The standing credit-assignment/exploration gap is now cleanly
+  the top open problem — with the generalization question (tickets/0009)
+  standing right next to it.
+
+**Watch items (off-script — neither pre-registered Good nor Bad):**
+
+- `policy/entropy` runs hot: 2.2–5.3 across the span (tail ~3.7–4.3) vs
+  Run 5's settled 1.9–2.4. Consistent with the advantage mix now being
+  intrinsic-dominated (`value_int_mean` ~3.3–5.5 vs `value_ext_mean`
+  ~0.4): with the ext stream no longer hallucinating dense reward, the
+  actor's objective is mostly normalized exploration bonus plus entropy
+  regularizer. Not a failure at this stage of learning, but it explains
+  the sampled-mode eval churn below, and any future extrinsic-dominated
+  phase should pull this back down.
+- `return_norm_scale_int` drifted 8.3 → ~13 (peak 15.2) while
+  `value_int_mean` and `disagreement_mean` stayed flat — the *spread* of
+  intrinsic returns is widening, not the mean. The normalizer divides it
+  out of the advantage, so no action now; carry into the next run as a
+  watch item.
+
+**Log correction (applies to Runs 1/3/5 above, recorded here rather than
+rewriting their Findings):** those entries compare `loss/kl_raw` — a
+per-dimension mean — against the **1.0 total** free-nats budget and
+conclude the KL term is "fully clamped and inert". `compute_losses`
+applies the floor per-dim (`free_nats / stoch_dim` = 1/32 ≈ 0.031), and
+kl_raw has ranged ~0.03–0.07 across runs — at or above the floor much of
+the time, so the KL gradient was active all along. No decision taken in
+those runs changes (recon health, the Run 3 burn-in verdict, and the
+Run 5 farming diagnosis never hinged on KL being inert), but the claim
+should not be repeated. Inline corrections added at the two spots.
 
 ### tickets/0008 Step 4 — acting-loop alignment fix, before/after eval
 
@@ -1077,7 +1154,8 @@ cd82         sampled        0.40         1     0.00    104.0          7.5
 lp85         sampled        0.40         1     0.00    269.4          5.5
 r11l         sampled        0.00         0     0.00    600.0          inf
 sp80         sampled        1.00         1     0.00     55.4         20.8
-  -> games_scored=4 games_won=0 (sampled)  [21 other games: 0.00]
+  -> games_scored=3 games_won=0 (sampled)  [r11l shown at 0.00 for the
+     post-fix comparison; 21 other games also 0.00]
 ```
 
 **Post-fix** (fix restored, `git diff training/online_actor.py` empty
@@ -1099,8 +1177,10 @@ sp80         sampled        1.00         1     0.00     71.0         17.2
 **Reading against the pre-registration:**
 
 - No regression on the headline aggregate: `games_scored` is unchanged in
-  greedy (4/25) and drops by one nominally in sampled (4→3), but the game
-  set isn't a subset — `r11l` (zero pre-fix) starts scoring post-fix
+  both modes (greedy 4/25, sampled 3/25 — the pre-fix table's original
+  "sampled=4" footer double-counted r11l's 0.00 row; corrected against
+  the raw JSON), though the sampled game set churns — `r11l` (zero
+  pre-fix) starts scoring post-fix
   (mean 0.20, first score at step 179), while `cd82`/`vc33` drop to zero
   under `sampled`'s stochastic action noise. `greedy` (the deterministic,
   lower-variance read of the policy) is unambiguously flat-to-better: `cd82`
@@ -1127,3 +1207,122 @@ improvement or parity on every scoring game. The next run (Run 7) trains
 online collection through the aligned loop for the first time; per
 tickets/0008 Step 5, its `online/*` scalars are not strictly comparable to
 Runs 3–6's for that reason.
+
+---
+
+# Run 7 — tickets/0009 held-out-games generalization protocol, from scratch (July 10, 2026)
+
+Runs 1–6 answered "can Thumper learn the games it practices on": world
+model healthy (Run 3), two-stream returns wired (Run 5), extrinsic
+objective bounded (Run 6), acting loop aligned (tickets/0008). What no run
+has measured is the actual competition: performance on a game that
+contributed **zero** training data. Every architectural claim of
+"generalizes across games" — the TaskEncoder macro-context above all —
+is untested on that claim; a macro-context that memorizes 25 game
+identities and one that infers rules from transitions are
+indistinguishable on training games. This run splits the 25 downloaded
+games 20/5 per tickets/0009's pre-registered split and reads zero-shot
+transfer directly.
+
+Three run-defining constraints, all from tickets/0009:
+
+- **From scratch** — no `--config.init-from`: every existing checkpoint's
+  world model trained on all 25 games, so warm-starting bakes held-out
+  dynamics into the weights undetectably. This also makes Run 7 the first
+  run whose *entire* collection goes through the tickets/0008-aligned
+  acting loop (Runs 3–6 collected through the misaligned fold), so its
+  `online/*` curves double as the clean post-fix baseline — at the price
+  that they are not strictly comparable to Runs 3–6's (per 0008 Step 5).
+- **Fresh output dir** — the resume guard would (correctly) refuse
+  `runs/two_stream_returns` anyway: its checkpoint's `train_games=[]`.
+- **The split is fixed in advance** (tickets/0009 Design principle 2):
+  held out `cd82, r11l, ft09, sk48, wa30`. cd82/r11l have demonstrated
+  score reachability (Run 3), so held-out scoring on them is achievable —
+  the eval is informative, not vacuously zero. lp85 (live extrinsic
+  signal) and sp80 (the only natural terminator; the continue head's real
+  terminals) deliberately stay in training. ft09/sk48/wa30 are
+  arbitrary-but-fixed unknowns for the harder zero-shot case.
+
+```sh
+# From scratch (NO --config.init-from), fresh output dir, 20-game training
+# round-robin (~5k steps/game at 100k total vs 4k/game in 25-game runs),
+# periodic zero-shot eval on the 5 held-out games every 10k env steps
+# (1 episode/game to keep the cadence affordable; the final full sweep
+# below is the real measurement).
+uv run python train.py \
+  --config.output-dir runs/held_out_v1 \
+  --config.train-games '["ar25","bp35","cn04","dc22","g50t","ka59","lf52","lp85","ls20","m0r0","re86","s5i5","sb26","sc25","sp80","su15","tn36","tr87","tu93","vc33"]' \
+  --config.eval-every 10000 \
+  --config.eval-games '["cd82","r11l","ft09","sk48","wa30"]' \
+  --config.eval-episodes-per-game 1
+
+# After the run: the full pre-registered protocol, all 25 games, both modes.
+uv run python eval.py --checkpoint runs/held_out_v1/latest.pt
+```
+
+Budget: 100k env steps at Run 3+ throughput (~5.5 env steps/s) ≈ 5h.
+
+## What to Look for
+
+`uv run tensorboard --logdir runs/held_out_v1/tb`. Read the final sweep as
+tickets/0009's three numbers: (1) train-set score — did losing 5 games
+cost learning?; (2) held-out cd82/r11l — zero-shot transfer where scoring
+is known reachable, **the headline**; (3) held-out ft09/sk48/wa30 — the
+harder unknowns. The honest baseline for (2)/(3) is what *random play*
+achieves on those games (Run 1's collection data): "beats random
+zero-shot" is the first defensible claim of generalization, pre-registered
+here before any number exists.
+
+**Good:**
+
+- From-scratch training rediscovers the Runs 3–6 arc on 20 games with no
+  regression in kind: recon < 0.01 with sharp samples by mid-run,
+  `dream_score_sum` bounded < 1 throughout (the 0006 objective holding
+  from step 0, not just after a resume), `value_ext_mean` sane, scoring
+  recurs on lp85/sp80 (the in-train scorers) at ≥ Run 6's rate, and the
+  final sweep's train-set table is not worse than Run 6's eval on the
+  same 20 games.
+- **The headline:** `eval/greedy/score/cd82` or `.../r11l` goes nonzero at
+  any eval checkpoint, and the final sweep confirms held-out mean_score >
+  0 on either — zero-shot scoring on a never-trained game, above what
+  random play produces there. That is the first direct evidence the
+  macro-context infers rather than memorizes.
+- `online/macro_context_norm` behaves on train games as in Runs 3–6
+  (O(1), wandering), and nothing pathological appears in eval on held-out
+  games (the eval harness exercising `m` on out-of-distribution dynamics
+  for the first time with aligned folds).
+
+**Bad:**
+
+- Train-set learning healthy but held-out **all-zero everywhere** —
+  every periodic eval and the final sweep, all 5 games, both modes, while
+  random play does better than zero on cd82/r11l. That is a clean negative
+  answer: the macro-context (as trained, at this scale/data) memorizes.
+  The response is not a bigger run; it is prioritizing test-time
+  adaptation (the 0010+ ticket sketched in tickets/0009's non-goals) over
+  zero-shot hope.
+- Train-set score at 100k clearly below Run 6's on the same games — the
+  held-out games mattered to training more than expected (unlikely at
+  +25% steps/game; if it happens, suspect the from-scratch/warm-start
+  difference first, since Runs 4–6 all rode Run 3's world model).
+
+**Ugly:**
+
+- Any held-out game appears in `online/*` scalars or the buffer, or the
+  run starts against a non-empty dir without tripping the resume guard —
+  tickets/0009 implementation bug; stop, fix, restart fresh (the
+  measurement is unsalvageable once contaminated).
+- From-scratch training fails to rediscover Run 3-era basics at matched
+  step counts (recon stuck high, imagination collapsing, zero scoring on
+  lp85/sp80 by 100k) — would mean Runs 4–6's competence was leaning on
+  the warm-start lineage harder than believed, and the from-scratch story
+  needs its own investigation before any generalization claim is made.
+
+Watch items carried from Run 6: `policy/entropy` hot (2.2–5.3) and
+`return_norm_scale_int` drift (8→13) — log their Run 7 trajectories in
+Findings either way; a from-scratch run tells us whether they are
+resume artifacts or steady-state properties of the current objective.
+
+## Findings
+
+(to be filled at run end — or mid-run if a pre-registered exit fires)
