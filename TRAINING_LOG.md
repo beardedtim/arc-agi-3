@@ -394,4 +394,391 @@ run's checkpoint via `--config.init-from`.
 
 ## Findings
 
+(Filled in July 10, morning after the overnight run.)
+
+**Success. Criterion 4 passes: imagination is fixed.** Ran to completion
+(100k env steps, 49,500/49,500 grad steps, ~4h50m wall-clock at ~5.7 env
+steps/s / ~2.9 grad steps/s — ~5× slower than Run 1, from the burn-in
+doubling each window's forward pass plus the actor-critic update). The
+"Ugly" imagination criterion did not fire; the fix addressed the root cause
+as diagnosed.
+
+**One comparability caveat the pre-registration got wrong:** this run
+exercised the *full* tickets/0003 loop — the actor-critic trained from grad
+step 1 and the policy (not the random collector) gathered data after the 1k
+prefill. Runs 1/2 predate 0003 and were world-model-only under random play,
+so despite `seed=0` the collected data diverges after prefill and nothing is
+frame-for-frame comparable. Matched-step comparisons below are qualitative.
+(This also means the pre-registered "green-light a separate 0003 run" decision
+is moot — the 0003 actor-critic already ran here, end to end, on top of the
+fix.)
+
+- **A/B script (run July 10, before judging the rerun):** on Run 2's
+  unfixed checkpoint, dreams with burned-in vs zeroed macro-context degrade
+  about equally — the pre-0004 diagnosis reproduces exactly. Outputs were
+  written to a scratch dir, not kept; the script is in the entry above.
+- **Imagination (the headline):** `imagine_step_*.png` at 9k/17k/31k/49k all
+  hold game identity and playfield structure across the full 8-step horizon
+  — moving sprites tracked, only minor sprite-level blurring late in the
+  horizon on the most dynamic games. Nothing resembling Run 2's 2–6-frame
+  disintegration into cross-game mush. On par with Run 1's quality.
+- **`train/grad_norm` recovered** to Run 1's band and below (medians
+  2.7/2.0/1.1 at 5k/10k/15k vs Run 2's 4.0/4.4/3.0; 0.20 by the end) — the
+  mechanical signature that the prior no longer leans on teacher-forced
+  per-step context.
+- **`loss/recon`: behind Run 1 beyond the ~20% band, but falling cleanly.**
+  Medians 0.056/0.037/0.029 at 5k/10k/15k vs Run 1's 0.042/0.022/0.018
+  (~35–65% behind), final 0.0100 vs 0.0060. Final recon samples are still
+  sharp. Per the pre-registered "Bad" clause this is the extend-the-budget
+  case, not a stop — and it's confounded: the policy's on-distribution data
+  is less uniform than random play's, and each window now trains on only
+  half its steps. One single-batch transient at grad step 10,067 (recon 3.1,
+  grad_norm 59) recovered immediately; no NaN/inf anywhere.
+- **`kl_raw` did *not* rise back toward Run 1's level** — the opposite:
+  ~0.05 flat vs Run 1's ~0.13→0.07 (Run 3 ends at 0.034). Both sit far
+  below the 1.0 free-nats floor, so the KL term stays inert either way. The
+  expected-recovery prediction was wrong, but the dreams prove the low KL is
+  now honest prior competence rather than the Run 2 crutch. No retuning, per
+  the ticket's non-goals.
+- **Ensemble non-degenerate but lower:** `disagreement_mean` 0.0023 at the
+  end vs Run 1's 0.0074 (same order of magnitude, as pre-registered).
+  Plausibly the new consumption loop at work: the policy is now *paid* in
+  disagreement (`intrinsic_scale=1.0`), collects where the ensemble is
+  uncertain, and trains the uncertainty away. Watch it doesn't collapse to
+  zero on longer runs.
+- **First signs of a learning policy:** `online/episode_return/cd82` hit 1.0
+  on 3 of its last episodes (env steps ~62k/74k/88k) and `r11l` once (~94k);
+  `online/win_rate/*` stayed 0 everywhere. Only 8 episodes per game total,
+  so this is suggestive, not conclusive. Actor-critic internals healthy
+  throughout: entropy 2.6–3.9, `policy/value_mean` tracking
+  `policy/imagined_return`, imagined returns dominated by intrinsic reward
+  (extrinsic ≈ 0), actor grad norms small and stable.
+- `online/macro_context_norm` rose to ~4.5 by ~30k env steps then decayed
+  to ~1.5–2.1 — the online collector's episode-long `m` accumulation (the
+  0002 follow-up mismatch) is live but not exploding.
+
+Decision: tickets/0004 validated and closed by this run; Run 2's pathology
+is gone at the root. Since the 0003 actor-critic already trained here, the
+pre-registered `--config.init-from` follow-up is unnecessary. Next run
+should target the two open threads this run surfaced: recon convergence
+under the halved effective window + policy-collected data (extend
+`total_env_steps` before touching knobs), and whether disagreement-as-reward
+eats its own signal over longer horizons.
+
+---
+
+# Run 4 — tickets/0005 two-stream returns, smoke run (July 10, 2026)
+
+Run 3 validated the world model end-to-end and showed exactly the failure
+tickets/0003 pre-registered as a follow-up trigger: the reward head predicts
+scoring transitions almost exactly, but the actor's objective structurally
+can't see it — one shared `ReturnNormalizer` sees intrinsic disagreement's
+continuous ~10-magnitude spread and normalizes a +1 level completion down to
+~0.1 units, once. tickets/0005 splits extrinsic (reward) and intrinsic
+(disagreement) into separate λ-returns, critic heads, and normalizers (one
+policy, advantage = `norm_ext(R_ext − v_ext) + intrinsic_scale ·
+norm_int(R_int − v_int)`), fixes the trainer storing step-cap timeouts as
+`terminated=True` (only `result.done` counts now), and adds reward-event-
+stratified batch sampling (`reward_window_frac=0.25` default) so the ~0.015%
+of steps with nonzero reward don't dilute out of training as the buffer
+fills.
+
+`Critic`'s parameter shapes changed (`ext_net`/`int_net` replace the single
+`net`), so Run 3's `latest.pt` is not resumable as-is —
+`--config.init-from` copies world-model weights only, same remedy as
+tickets/0003's note. Fresh output dir, fresh policy/critic/buffer under the
+fixed objective (Run 3's buffer also carries ~166 timeout steps mislabeled
+`terminated=True`, another reason not to resume it). All other flags at
+Run 1/2/3 defaults; this is a small smoke run, not the full 100k-step
+comparison run (out of scope per tickets/0005's Verification section) — a
+few hundred grad steps past prefill is enough to see whether the split
+scalars behave as designed before committing a full budget.
+
+```sh
+uv run python train.py \
+  --config.output-dir runs/two_stream_returns \
+  --config.init-from runs/burn_in_fix/latest.pt \
+  --config.total-env-steps 3000
+```
+
+## What to Look for
+
+This is a wiring smoke test (tickets/0005 acceptance criterion 3), not a
+verdict on whether the split changes policy behavior — that needs the full
+run this entry will be superseded by.
+
+**Good:**
+
+- `policy/return_norm_scale_ext` and `policy/return_norm_scale_int` both
+  finite and visibly diverging from each other: `_int` climbing toward
+  Run 3's ~10 (disagreement dominates its own stream, same as before the
+  split), `_ext` staying near its 1.0 floor (extrinsic returns are still
+  sparse at this budget — nothing wrong with that yet, it's the pre-split
+  drowning made visible as a chart rather than fixed by itself).
+- `train/reward_windows_in_batch` nonzero at least once any scoring window
+  (cd82/r11l/sp80 transitions) is in the buffer — confirms the stratified
+  sampler is finding and using them, not just falling back to uniform.
+- `policy/entropy` in a healthy range (not collapsing toward 0, not pinned
+  at max), comparable to Run 3's 2.6–3.9.
+- `loss/recon` falling as in Run 3, not degraded by stratified sampling
+  over-representing the three scoring games in early batches.
+- No NaN/inf anywhere; checkpoint write/resume round-trips both
+  `return_norm_scales.ext` and `.int`.
+
+**Bad (tune, don't stop):**
+
+- `return_norm_scale_ext` and `_int` tracking each other closely instead of
+  diverging — at this short a budget could just mean too few scoring
+  windows sampled yet; extend before concluding the split isn't taking
+  effect.
+- `reward_windows_in_batch` staying at 0 the whole run — check the buffer
+  actually contains a scoring episode before suspecting the sampler itself
+  (Run 3 games only score ~0.015% of steps; a 3k-step smoke run's buffer may
+  legitimately have none carried over from init, since `--init-from` does
+  not copy the buffer).
+
+**Ugly (stop, something's broken):**
+
+- Either critic head's loss or value mean is NaN/inf, or grad norms spike
+  and don't recover — likely a channel-order mismatch between
+  `Critic.forward`'s `(ext, int)` stacking and `actor_critic_losses`'
+  indexing (`[..., 0]` / `[..., 1]`).
+- `sync_critic_target` visibly not copying one of the two heads (compare
+  `critic`/`critic_target` state dicts) — would show up as one stream's
+  target values frozen at init forever.
+
+## Findings
+
+(Watched live and filled in July 10, immediately after the run.)
+
+**Pass — promote to the full run.** Ran to completion (3,000 env steps,
+1,000/1,000 grad steps, ~7 min wall-clock at ~5.5 env steps/s / ~2.8 grad
+steps/s — Run 3's throughput, so the split costs nothing measurable). No
+"Ugly" criterion fired; every "Good" criterion passed outright or resolved
+to its pre-registered benign case. One watch-item (entropy, below) to
+pre-register for the full run, not a blocker.
+
+- **Scales split and diverging:** `return_norm_scale_ext` settled ~0.183
+  (flat) while `_int` climbed 0.33 → 0.775 over the back half — finite,
+  independent, and visibly diverging. Neither approached Run 3's ~10; the
+  pre-registration missed that `--init-from` warm-starts a *converged*
+  world model, so disagreement starts at Run 3's final ~0.005, not a fresh
+  model's large early values. Note the logged value is the raw spread EMA;
+  the `max(1, scale)` floor is applied at normalize time, so with both
+  scales under 1.0 advantages currently pass through unscaled — by design.
+- **No channel swap** (the pre-registered "Ugly"): `value_ext_mean` tracks
+  `imagined_return_ext` (~0.12) and `value_int_mean` tracks
+  `imagined_return_int` (~0.87) — two clearly distinct, correctly-paired
+  streams. Both critic losses finite and falling; actor/critic grad norms
+  small and stable; no NaN/inf anywhere.
+- **`reward_windows_in_batch` stayed 0 — the benign case, confirmed:** the
+  buffer's five completed episodes (ar25/bp35/cd82/cn04/dc22) all hit the
+  600-step cap with zero return, so there were no scoring windows to
+  stratify toward (cd82 scored in Run 3 but not in these 600 steps). The
+  sampler path is covered by unit tests
+  (`test_reward_frac_one_puts_event_in_every_loss_window`, fallback-to-
+  uniform, position-varies; suite: 76/76 passing). The full run must show
+  this go nonzero once any game scores — carry that forward as a criterion.
+- **Checkpoint/resume round-trip verified:** `latest.pt` holds
+  `return_norm_scales.ext/.int` matching the final TB values exactly
+  (0.18276 / 0.77457); `critic` and `critic_target` both contain
+  `ext_net`/`int_net` (target sync covered by
+  `test_sync_critic_target_copies_both_heads`). Rerunning the same command
+  resumed with continuous counters (`env_steps=3000, grad_steps=1000`) and
+  exited cleanly at the met budget. On resume `--init-from` is ignored
+  (trainer's `elif`), so the promote command below can keep the flag.
+- **World model unharmed:** `loss/recon` started at warm-start quality
+  (~0.009) and drifted down (~0.005 median late); grad step 1000's recon
+  is near pixel-perfect and its imagination holds structure and game
+  identity across the full horizon. `kl_raw` ~0.05, `train/grad_norm`
+  bounded (<1.2). Stratified sampling never engaged (no events), so its
+  early-batch skew remains untested — full-run item, not a smoke item.
+- **Watch-item — entropy runs lower than Run 3's band:** median fell 3.7 →
+  ~0.9–1.0 nats over 1,000 grad steps (min 0.41), vs Run 3's 2.6–3.9. The
+  mechanism is the fix itself working: pre-split, the shared normalizer's
+  ~10 scale shrank *all* advantages ~10×, making `entropy_scale=1e-3`
+  relatively strong; post-split both scales sit at the 1.0 floor, so
+  advantages pass through full-size and the entropy bonus is ~10× weaker
+  relative to them. Behaviorally nothing is degenerate — online action
+  fractions stay spread across all 7 types (7.5–21%), and
+  `intrinsic_reward_mean` *tripled* (0.0055 → 0.016): the policy is
+  actively steering into ensemble disagreement, which is precisely what
+  the un-drowned intrinsic stream was built to buy. Entropy also flattened
+  ~0.8–1.1 over the last 300 steps rather than continuing toward 0.
+
+Decision: **promoted.** Extend this same run in place (resume picks up
+`latest.pt`/`buffer.pt` at 3k steps; a fresh dir would only discard 3k
+steps of on-objective data):
+
+```sh
+uv run python train.py \
+  --config.output-dir runs/two_stream_returns \
+  --config.init-from runs/burn_in_fix/latest.pt \
+  --config.total-env-steps 100000
+```
+
+Pre-registered triggers for the full run (in addition to Run 3's open
+threads — recon convergence and disagreement self-consumption):
+
+- **Entropy:** if `policy/entropy` trends toward ~0 (median < ~0.3
+  sustained) or any single `online/action_type_frac/*` exceeds ~0.6, raise
+  `entropy_scale` (3e-3 first) — do not touch the normalizers; their floor
+  behaving this way is the design.
+- **Stratification:** once any `online/episode_return/*` > 0,
+  `train/reward_windows_in_batch` must go nonzero within a few hundred
+  grad steps; if it doesn't, the sampler's event index isn't seeing real
+  episodes the way the unit tests' synthetic ones do — stop and debug.
+- **Extrinsic stream waking up:** on scoring events, `_ext` scale and
+  `policy/imagined_return_ext` should move; the whole point of the split
+  is that a +1 level completion now lands as an O(1) advantage.
+
+(These triggers are folded into Run 5's pre-registration below.)
+
+---
+
+# Run 5 — tickets/0005 two-stream returns, full run (July 10, 2026)
+
+Promotion of Run 4's validated wiring to the full budget, per that entry's
+decision: **extend the same run in place** — resume picks up
+`runs/two_stream_returns/latest.pt` + `buffer.pt` at 3k env steps / 1k grad
+steps, keeping the smoke run's on-objective data and warm world model. The
+question this run exists to answer is the one tickets/0005 was written for:
+**once a +1 scoring event lands as an O(1) extrinsic advantage, does the
+actor learn to score on purpose?** Run 3's reward head predicted scoring
+transitions almost exactly while its actor structurally couldn't see them
+(4 incidental scores across ~200 episodes, win rate 0 everywhere); this run
+points the split streams, the stratified sampler, and a warm-started reward
+head at exactly that failure. It also carries Run 3's two open threads —
+recon convergence under policy-collected data with the halved effective
+window, and whether disagreement-as-reward eats its own signal over long
+horizons — plus Run 4's entropy watch-item.
+
+Budget arithmetic: ~97k env steps remain at Run 4's ~5.5 env steps/s ≈
+**~5h wall-clock**, adding ~48.5k grad steps (49.5k lifetime). There is no
+second prefill on resume: the policy collects from step 3,001 onward.
+Comparisons against Run 3 are qualitative-only (warm-started world model,
+fresh policy/critic, different objective — nothing is frame-for-frame
+comparable despite `seed=0`).
+
+```sh
+# Same output dir as Run 4 (deliberately, for once): resume continues the
+# smoke run instead of discarding its 3k steps. --init-from is inert on
+# resume (trainer's elif) but kept as the correct cold-start fallback if
+# latest.pt were ever missing. total-env-steps is the 100k default, passed
+# explicitly because raising it is the entire difference from Run 4.
+uv run python train.py \
+  --config.output-dir runs/two_stream_returns \
+  --config.init-from runs/burn_in_fix/latest.pt \
+  --config.total-env-steps 100000
+```
+
+## What to Look for
+
+`uv run tensorboard --logdir runs/two_stream_returns/tb`. Note the smoke
+run's first 1k grad steps are part of the same curves; "early" below means
+grad steps ~1k–5k, and matched-step comparisons to Run 3 offset by nothing
+(both measure grad steps from their own step 1, close enough at this
+granularity).
+
+**Good:**
+
+- **The headline — extrinsic stream wakes up, in causal order.** (1) Some
+  game scores under intrinsic-driven play (`online/episode_return/*` > 0 —
+  cd82/r11l are the Run 3 precedents, sp80 the natural terminator); (2)
+  within a few hundred grad steps of that episode completing,
+  `train/reward_windows_in_batch` goes nonzero and stays intermittently
+  nonzero (stratification targets `reward_window_frac=0.25` of each batch,
+  subject to available events); (3) `policy/return_norm_scale_ext` lifts
+  off its ~0.18 resting value and `policy/imagined_return_ext` /
+  `policy/value_ext_mean` move together off their bootstrap-dominated
+  ~0.12; (4) scoring recurs *more often than Run 3's ~4-in-200-episodes
+  incidental rate* — repeated returns on the same game, ideally any
+  `online/win_rate/*` > 0. Steps 1–3 are wiring doing its job; step 4 is
+  the actual behavioral claim of tickets/0005. Partial credit is
+  informative: 1–3 without 4 is a credit-assignment finding, not a wiring
+  failure (see Decision).
+- **Entropy stabilizes rather than collapsing** (Run 4's watch-item):
+  `policy/entropy` holding a floor around ~0.5–1.5 nats with all
+  `online/action_type_frac/*` staying under ~0.6. Lower than Run 3's
+  2.6–3.9 is *expected* (advantages are no longer shrunk ~10× by the old
+  shared scale, so `entropy_scale=1e-3` is relatively weaker by design).
+- **Recon keeps converging:** `loss/recon` ending at or below Run 3's final
+  0.0100 (warm start + full budget should beat it; Run 1's 0.0060 is the
+  stretch bar), samples staying sharp across many games, imagination
+  holding the horizon as in Runs 3/4.
+- **Disagreement decays without dying** (Run 3's self-consumption thread):
+  `wm/disagreement_mean` may fall well below Run 3's final 0.0023 as the
+  policy hunts it down — that's the loop working — but should stay
+  measurably above zero with `p90` structure across games.
+  `return_norm_scale_int` tracking the intrinsic return spread downward is
+  the normalizer doing its job; note the `max(1, scale)` floor means
+  sub-1.0 intrinsic advantages pass through unscaled and *naturally
+  shrink* as disagreement depletes, gracefully handing dominance to the
+  extrinsic stream. That handoff visibly starting (int stream's share of
+  the advantage falling while ext's rises) would be the best possible
+  version of this run.
+- **Mechanics:** checkpoints every 5k env steps; kill + rerun resumes with
+  continuous counters and both normalizer scales; `train/grad_norm`
+  bounded; `online/macro_context_norm` in Run 3's ~1.5–5 band; no NaN/inf.
+
+**Bad (tune, don't necessarily stop):**
+
+- **Entropy trigger fires:** `policy/entropy` median below ~0.3 sustained
+  for a few hundred grad steps, or any single `online/action_type_frac/*`
+  above ~0.6. Remedy: kill, resume with `--config.entropy-scale 3e-3`
+  (`entropy_scale` is a *trainer*-level flag, not part of the checkpoint's
+  saved `ThumperConfig`, so it takes effect on resume — verified in
+  trainer.py). Log the change and the grad step it happened at here. Do
+  not touch the normalizers; their floor behavior is the design.
+- **No scoring events all run:** the split can't be judged either way —
+  an *exploration* shortfall, not a tickets/0005 defect. Don't retune this
+  run's knobs in response; ticket the exploration side (Run 1's episode-cap
+  observation and tickets/0002's original motivation) and consider whether
+  intrinsic-only play should find reward more often than random did.
+- **Recon behind Run 3 at matched budget but falling cleanly** — same
+  extend-before-tuning clause as Runs 3/4.
+- `return_norm_scale_int` climbing past ~1 and beyond: normalization is
+  then actually engaging on the intrinsic stream — fine in itself; only
+  worth attention if it runs away upward (unbounded disagreement growth
+  usually means the world model is being destabilized by its own data).
+
+**Ugly (stop and investigate):**
+
+- **Scoring episodes exist in the buffer but `reward_windows_in_batch`
+  stays 0** for ~1k grad steps after one completes — the stratified
+  sampler isn't finding real events the way it finds the unit tests'
+  synthetic ones (`Episode.rewards`-derived index vs. real episode layout;
+  suspect the `loss_offset`/burn-in windowing math first). Everything
+  downstream of the split depends on this path; nothing else is worth
+  reading until it works.
+- **Extrinsic critic destabilizes at first contact with real events:**
+  `policy/value_ext_mean` or the ext half of `policy/critic_loss` spiking
+  or going NaN right after the first nonzero reward windows are sampled —
+  a +1 target after tens of thousands of zeros is exactly where an
+  unclipped regression head jumps. (The two-stream design isolates any
+  such damage from the int stream — verify the int stream indeed stays
+  clean, which localizes the bug.)
+- **Joint intrinsic/entropy death:** `wm/disagreement_mean` at ~0 *and*
+  entropy pinned near 0 *and* no extrinsic signal yet — the policy fully
+  exploited a depleted intrinsic signal and has no exploration pressure
+  left. This is the self-consumption failure mode Run 3 flagged; it needs
+  a design response (disagreement annealing, entropy floor, or count-based
+  fallback), not a longer run.
+- The perennials: NaN/inf anywhere, sustained grad-norm blowup, resume
+  discontinuities.
+
+Decision this run should produce — one of three exits, pre-committed:
+
+1. **Behavior change confirmed** (Good #1 including step 4): tickets/0005
+   closes validated; next work is scale (budget, capacity, more games in
+   parallel) and win-rate-oriented evaluation.
+2. **Wiring confirmed, behavior unchanged** (steps 1–3 fire, scoring stays
+   incidental): the bottleneck has moved past normalization to credit
+   assignment — imagination horizon, `gamma`, or reward-to-action distance;
+   write that ticket with this run's scalars as evidence.
+3. **No scoring events at all:** exploration ticket (see Bad); rerunning
+   0005 harder is explicitly not the move.
+
+## Findings
+
 _Pending — fill in after the run._

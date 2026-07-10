@@ -6,6 +6,12 @@ Kept as pure functions (plus one small stateful normalizer) rather than
 methods on Thumper/Trainer, mirroring how `WorldModel.compute_losses` owns
 the world-model math -- this way the return computation and loss math unit
 test in isolation from the env/replay-buffer machinery.
+
+Two-stream returns (tickets/0005): extrinsic (reward) and intrinsic
+(disagreement) each get their own lambda-return, critic head, target-value
+bootstrap, and `ReturnNormalizer` -- see `actor_critic_losses`. Splitting
+them stops the (continuous, ~10x larger) intrinsic stream from drowning the
+(sparse, O(1)) extrinsic stream inside one shared normalizer.
 """
 from dataclasses import dataclass
 
@@ -67,6 +73,11 @@ class ActorCriticConfig:
     return_lambda: float = 0.95
     entropy_scale: float = 1e-3
     intrinsic_scale: float = 1.0
+    """Weight on the *normalized* intrinsic advantage relative to the
+    *normalized* extrinsic advantage (tickets/0005). Now a true weight
+    between two same-scale (O(1)) streams, not a unit conversion between a
+    sparse ~1-magnitude reward stream and a continuous ~10-magnitude
+    disagreement stream -- see `ReturnNormalizer`'s `max(1, scale)` floor."""
 
 
 def actor_critic_losses(
@@ -74,7 +85,8 @@ def actor_critic_losses(
     policy: Policy,
     critic: Critic,
     critic_target: Critic,
-    normalizer: ReturnNormalizer,
+    normalizer_ext: ReturnNormalizer,
+    normalizer_int: ReturnNormalizer,
     cfg: ActorCriticConfig,
 ) -> dict[str, Tensor]:
     """The with-grad second pass over a grad-free `Thumper.dream` rollout.
@@ -83,19 +95,33 @@ def actor_critic_losses(
     and entropy) and `critic` (for the value baseline), so gradients flow
     only into `policy`/`critic` -- `dream`'s tensors carry no autograd graph
     to begin with (world model + old policy sample were under no_grad).
+
+    Two-stream returns (tickets/0005): extrinsic (predicted reward) and
+    intrinsic (ensemble disagreement) each get their own lambda-return,
+    critic head (`Critic`'s channel 0 / channel 1), target-value bootstrap,
+    and `ReturnNormalizer`. The actor's advantage is the weighted sum of the
+    two *normalized* advantages -- this is what keeps a sparse +1 level
+    completion visible against a continuous stream of exploration payment
+    (see tickets/0005's Design principle 1).
     """
     features = dream["features"]  # (N, H+1, feature_dim)
     N, H = dream["action_types"].shape
 
-    rewards = dream["reward"] + cfg.intrinsic_scale * dream["intrinsic"]
     discounts = cfg.gamma * dream["continue_prob"]
 
     with torch.no_grad():
-        target_values = critic_target(features)  # (N, H+1)
-    returns = lambda_returns(rewards, discounts, target_values, cfg.return_lambda)  # (N, H)
+        target_values = critic_target(features)  # (N, H+1, 2)
+    returns_ext = lambda_returns(
+        dream["reward"], discounts, target_values[..., 0], cfg.return_lambda
+    )  # (N, H)
+    returns_int = lambda_returns(
+        dream["intrinsic"], discounts, target_values[..., 1], cfg.return_lambda
+    )  # (N, H)
 
-    values = critic(features[:, :-1])  # (N, H), with grad
-    critic_loss = F.mse_loss(values, returns.detach())
+    values = critic(features[:, :-1])  # (N, H, 2), with grad
+    critic_loss = F.mse_loss(values[..., 0], returns_ext.detach()) + F.mse_loss(
+        values[..., 1], returns_int.detach()
+    )
 
     features_flat = features[:, :-1].reshape(N * H, -1)
     action_types_flat = dream["action_types"].reshape(N * H)
@@ -104,18 +130,24 @@ def actor_critic_losses(
     mask_flat = available_actions.unsqueeze(1).expand(N, H, -1).reshape(N * H, -1)
     log_prob, entropy = policy.log_prob_entropy(features_flat, action_types_flat, coords_flat, mask_flat)
 
-    baseline = values.detach()
-    advantage = normalizer.normalize(returns - baseline)
+    baseline_ext = values[..., 0].detach()
+    baseline_int = values[..., 1].detach()
+    advantage_ext = normalizer_ext.normalize(returns_ext - baseline_ext)
+    advantage_int = normalizer_int.normalize(returns_int - baseline_int)
+    advantage = advantage_ext + cfg.intrinsic_scale * advantage_int
     actor_loss = -(log_prob * advantage.detach().flatten()).mean() - cfg.entropy_scale * entropy.mean()
 
-    normalizer.update(returns)
+    normalizer_ext.update(returns_ext)
+    normalizer_int.update(returns_int)
 
     return {
         "actor_loss": actor_loss,
         "critic_loss": critic_loss,
         "entropy": entropy.mean().detach(),
-        "imagined_return": returns.mean().detach(),
+        "imagined_return_ext": returns_ext.mean().detach(),
+        "imagined_return_int": returns_int.mean().detach(),
         "intrinsic_mean": dream["intrinsic"].mean().detach(),
         "extrinsic_mean": dream["reward"].mean().detach(),
-        "value_mean": values.mean().detach(),
+        "value_ext_mean": values[..., 0].mean().detach(),
+        "value_int_mean": values[..., 1].mean().detach(),
     }

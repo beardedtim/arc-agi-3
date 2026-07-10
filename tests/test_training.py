@@ -4,7 +4,8 @@ sample renderers. Uses small_config() so the suite stays fast and CPU-only;
 no real env needed."""
 import torch
 
-from model.actions import NUM_ACTION_TYPES
+from env.env import StepResult
+from model.actions import NUM_ACTION_TYPES, RESET
 from tests.conftest import GRID, STACK, small_config
 from training.qualitative import save_imagination_check, save_recon_check
 from training.replay_buffer import ReplayBuffer
@@ -240,7 +241,8 @@ class TestTrainer:
         assert len(resumed.critic_optimizer.state_dict()["state"]) == len(
             trainer.critic_optimizer.state_dict()["state"]
         )
-        assert resumed.return_normalizer.scale == trainer.return_normalizer.scale
+        assert resumed.return_normalizer_ext.scale == trainer.return_normalizer_ext.scale
+        assert resumed.return_normalizer_int.scale == trainer.return_normalizer_int.scale
         for (n1, p1), (n2, p2) in zip(
             trainer.thumper.state_dict().items(), resumed.thumper.state_dict().items()
         ):
@@ -283,6 +285,100 @@ class TestTrainer:
         assert warm.grad_steps == 0
         assert warm.env_steps == 0
         assert warm.buffer.total_steps == 0
+
+
+class TestTruncation:
+    """tickets/0005: the continue head must only ever see real deaths --
+    a step-cap timeout is truncation, not termination."""
+
+    def _fake_result(self, done: bool = False) -> StepResult:
+        return StepResult(
+            frame=torch.zeros(GRID, GRID, dtype=torch.long),
+            reward=0,
+            done=done,
+            won=False,
+            available_actions=[RESET],
+            levels_completed=0,
+        )
+
+    def _trainer(self, tmp_path, **overrides):
+        overrides.setdefault("output_dir", str(tmp_path))
+        overrides.setdefault("resume", False)
+        overrides.setdefault("prefill_steps", 10_000)  # stay on random-action path
+        cfg = TrainerConfig(thumper=small_config(), batch_size=2, seq_len=3, **overrides)
+        trainer = Trainer(cfg)
+        trainer.env.games = lambda: ["fake_game"]
+        trainer.env.reset = lambda game: self._fake_result(done=False)
+        return trainer
+
+    def test_step_cap_stores_terminated_false_and_still_rotates_episode(self, tmp_path):
+        trainer = self._trainer(tmp_path, timeout_env_steps=1, total_env_steps=1)
+        trainer.env.step = lambda action_type, x=None, y=None: self._fake_result(done=False)
+        trainer.train()
+
+        # exactly one env step happened, hit the 1-step cap, rotated to a
+        # new episode -- the buffer's first episode's second (capped) entry
+        # must be terminated=False.
+        first_episode = trainer.buffer.episodes[0]
+        assert first_episode.terminateds[-1] is False
+        assert len(trainer.buffer.episodes) == 2  # rotated into a fresh episode
+
+    def test_real_done_stores_terminated_true(self, tmp_path):
+        trainer = self._trainer(tmp_path, timeout_env_steps=1_000_000, total_env_steps=1)
+        trainer.env.step = lambda action_type, x=None, y=None: self._fake_result(done=True)
+        trainer.train()
+
+        first_episode = trainer.buffer.episodes[0]
+        assert first_episode.terminateds[-1] is True
+        assert len(trainer.buffer.episodes) == 2  # done still rotates the episode
+
+
+class TestStratifiedSampling:
+    def _episode_with_one_reward(self, buffer: ReplayBuffer, length: int, reward_t: int, game_id: int = 0):
+        episode = buffer.start_episode(game_id=game_id)
+        for t in range(length):
+            frame = torch.full((GRID, GRID), t, dtype=torch.long)
+            buffer.add_step(
+                episode,
+                frame,
+                action_type=t % 7,
+                coords=(1, 2),
+                reward=1.0 if t == reward_t else 0.0,
+                terminated=(t == length - 1),
+                internal_state=0.0,
+            )
+        return episode
+
+    def test_reward_frac_one_puts_event_in_every_loss_window(self):
+        buffer = ReplayBuffer(capacity=1000, frame_stack=STACK)
+        self._episode_with_one_reward(buffer, length=30, reward_t=20)
+
+        loss_offset = 4
+        seq_len = 10
+        for _ in range(5):
+            batch = buffer.sample(batch_size=8, seq_len=seq_len, reward_frac=1.0, loss_offset=loss_offset)
+            loss_window_rewards = batch["rewards"][:, loss_offset:]
+            assert (loss_window_rewards != 0).any(dim=1).all()
+
+    def test_reward_frac_with_zero_events_falls_back_to_uniform(self):
+        buffer = ReplayBuffer(capacity=1000, frame_stack=STACK)
+        _fill_episode(buffer, length=10)  # all-zero rewards
+        batch = buffer.sample(batch_size=4, seq_len=5, reward_frac=0.25, loss_offset=1)
+        assert batch["observations"].shape == (4, 5, STACK, GRID, GRID)
+
+    def test_event_position_within_loss_window_varies_across_draws(self):
+        buffer = ReplayBuffer(capacity=1000, frame_stack=STACK)
+        self._episode_with_one_reward(buffer, length=40, reward_t=25)
+
+        loss_offset = 4
+        seq_len = 12
+        positions = set()
+        for _ in range(20):
+            batch = buffer.sample(batch_size=4, seq_len=seq_len, reward_frac=1.0, loss_offset=loss_offset)
+            nonzero = (batch["rewards"][:, loss_offset:] != 0).nonzero()
+            for row in nonzero:
+                positions.add(int(row[1]))
+        assert len(positions) > 1
 
 
 class TestQualitativeChecks:

@@ -5,13 +5,24 @@ Interleaves collection and training: each env step feeds the replay buffer
 (uniform-random over available_actions during `prefill_steps`, then the
 policy itself, round-robin across every downloaded game), and gradient
 steps catch up at a fixed env-steps-per-grad-step ratio (`train_every`).
+The buffer only ever stores a real death (`result.done`) as `terminated` --
+a step-cap timeout still rotates the episode locally but is truncation, not
+termination, so it never reaches the continue head (tickets/0005). Batch
+sampling is reward-event-stratified (`reward_window_frac`,
+`training/replay_buffer.py`): a target fraction of each batch is drawn from
+windows whose loss window contains a nonzero-reward step, since those are
+rare (~0.015% of steps in Run 3) and dilute under plain uniform sampling as
+the buffer grows.
 Each grad step does two things (see tickets/0003):
   1. one WorldModel.compute_losses update (unchanged from tickets/0001);
   2. one actor-critic update trained entirely in imagination
-     (`Thumper.dream` + `training/actor_critic.py`): reward = predicted
-     extrinsic reward + Plan2Explore disagreement (intrinsic), REINFORCE
-     with a learned critic baseline (no backprop through dynamics, since
-     the action space is categorical).
+     (`Thumper.dream` + `training/actor_critic.py`): two-stream returns
+     (tickets/0005) -- extrinsic (predicted reward) and intrinsic
+     (Plan2Explore disagreement) each get their own lambda-return, critic
+     head, and `ReturnNormalizer`, so a sparse level completion can't be
+     drowned by continuous exploration payment. REINFORCE with a learned
+     critic baseline (no backprop through dynamics, since the action space
+     is categorical).
 The trained policy replaces the random collector after prefill, so
 exploration becomes disagreement-seeking instead of uniform.
 
@@ -97,10 +108,19 @@ class TrainerConfig:
     actor_lr: float = 8e-5
     critic_lr: float = 8e-5
     intrinsic_scale: float = 1.0
-    """Weight on disagreement vs predicted extrinsic reward."""
+    """Weight on the normalized intrinsic advantage vs the normalized
+    extrinsic advantage (tickets/0005) -- see ActorCriticConfig."""
     critic_target_every: int = 100
     """Grad steps between hard target-critic syncs."""
     return_norm_decay: float = 0.99
+    reward_window_frac: float = 0.25
+    """Target fraction of each sampled batch drawn from windows whose loss
+    window (the trailing seq_len steps, after burn-in) contains a
+    nonzero-reward step (tickets/0005); 0 disables. Reward events are rare
+    (~0.015% of steps in Run 3), so uniform window sampling dilutes them as
+    the buffer grows -- this keeps the reward head (and the rest of
+    compute_losses) training on scoring transitions at a controlled rate
+    independent of buffer size."""
 
     # logging / qualitative checks (in gradient steps)
     log_every: int = 50
@@ -167,7 +187,8 @@ class Trainer:
         self.optimizer = torch.optim.Adam(self.thumper.world_model.parameters(), lr=c.lr)
         self.actor_optimizer = torch.optim.Adam(self.thumper.policy.parameters(), lr=c.actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.thumper.critic.parameters(), lr=c.critic_lr)
-        self.return_normalizer = ReturnNormalizer(decay=c.return_norm_decay)
+        self.return_normalizer_ext = ReturnNormalizer(decay=c.return_norm_decay)
+        self.return_normalizer_int = ReturnNormalizer(decay=c.return_norm_decay)
         self.buffer = ReplayBuffer(
             capacity=c.buffer_capacity,
             frame_stack=c.thumper.world_model.frame_stack,
@@ -184,7 +205,8 @@ class Trainer:
             self.optimizer.load_state_dict(payload["optimizer_state_dict"])
             self.actor_optimizer.load_state_dict(payload["actor_optimizer_state_dict"])
             self.critic_optimizer.load_state_dict(payload["critic_optimizer_state_dict"])
-            self.return_normalizer.load_state_dict(payload["return_norm_scale"])
+            self.return_normalizer_ext.load_state_dict(payload["return_norm_scales"]["ext"])
+            self.return_normalizer_int.load_state_dict(payload["return_norm_scales"]["int"])
             self.env_steps = payload["env_steps"]
             self.grad_steps = payload["grad_steps"]
             if self.buffer_path().exists():
@@ -326,10 +348,13 @@ class Trainer:
 
     def train_step(self) -> dict[str, float]:
         c = self.config
-        batch = self.buffer.sample(c.batch_size, c.burn_in + c.seq_len)
+        batch = self.buffer.sample(
+            c.batch_size, c.burn_in + c.seq_len, reward_frac=c.reward_window_frac, loss_offset=c.burn_in
+        )
         batch = {k: v.to(c.device) for k, v in batch.items()}
         window_batch = {k: v[:, c.burn_in :] for k, v in batch.items()}
         self._last_batch = batch  # full (burn_in-prefixed) batch, reused by the qualitative checks
+        reward_windows_in_batch = int((window_batch["rewards"] != 0).any(dim=1).sum().item())
 
         wm = self.thumper.world_model
         outputs = wm.forward_sequence(
@@ -352,6 +377,7 @@ class Trainer:
 
         metrics = {k: v.item() for k, v in losses.items()}
         metrics["grad_norm"] = grad_norm.item()
+        metrics["reward_windows_in_batch"] = float(reward_windows_in_batch)
         self._log_train_scalars(metrics, outputs, window_batch)
 
         policy_metrics = self.policy_train_step(outputs, window_batch)
@@ -385,7 +411,13 @@ class Trainer:
             intrinsic_scale=c.intrinsic_scale,
         )
         losses = actor_critic_losses(
-            dream, thumper.policy, thumper.critic, thumper.critic_target, self.return_normalizer, ac_cfg
+            dream,
+            thumper.policy,
+            thumper.critic,
+            thumper.critic_target,
+            self.return_normalizer_ext,
+            self.return_normalizer_int,
+            ac_cfg,
         )
 
         self.actor_optimizer.zero_grad()
@@ -414,11 +446,14 @@ class Trainer:
         w.add_scalar("policy/actor_loss", metrics["actor_loss"], step)
         w.add_scalar("policy/critic_loss", metrics["critic_loss"], step)
         w.add_scalar("policy/entropy", metrics["entropy"], step)
-        w.add_scalar("policy/imagined_return", metrics["imagined_return"], step)
+        w.add_scalar("policy/imagined_return_ext", metrics["imagined_return_ext"], step)
+        w.add_scalar("policy/imagined_return_int", metrics["imagined_return_int"], step)
         w.add_scalar("policy/intrinsic_reward_mean", metrics["intrinsic_mean"], step)
         w.add_scalar("policy/extrinsic_reward_mean", metrics["extrinsic_mean"], step)
-        w.add_scalar("policy/value_mean", metrics["value_mean"], step)
-        w.add_scalar("policy/return_norm_scale", self.return_normalizer.scale, step)
+        w.add_scalar("policy/value_ext_mean", metrics["value_ext_mean"], step)
+        w.add_scalar("policy/value_int_mean", metrics["value_int_mean"], step)
+        w.add_scalar("policy/return_norm_scale_ext", self.return_normalizer_ext.scale, step)
+        w.add_scalar("policy/return_norm_scale_int", self.return_normalizer_int.scale, step)
         w.add_scalar("policy/grad_norm_actor", metrics["grad_norm_actor"], step)
         w.add_scalar("policy/grad_norm_critic", metrics["grad_norm_critic"], step)
 
@@ -441,6 +476,7 @@ class Trainer:
             w.add_scalar("wm/ensemble_loss", metrics["ensemble_loss"], step)
         w.add_scalar("train/kl_weight", self.kl_weight(), step)
         w.add_scalar("train/grad_norm", metrics["grad_norm"], step)
+        w.add_scalar("train/reward_windows_in_batch", metrics["reward_windows_in_batch"], step)
         w.add_scalar("online/env_steps", self.env_steps, step)
         w.add_scalar("online/buffer_size", self.buffer.total_steps, step)
 
@@ -506,13 +542,17 @@ class Trainer:
                 terminate_due_to_max_steps = env_steps >= c.timeout_env_steps
                 terminated = result.done or terminate_due_to_max_steps
 
+                # The continue head must only ever see real deaths -- a
+                # step-cap timeout is truncation, not termination, so the
+                # buffer stores result.done (not `terminated`, which also
+                # rotates the episode below). See tickets/0005.
                 self.buffer.add_step(
                     episode,
                     result.frame,
                     action_type,
                     coords,
                     float(result.reward),
-                    terminated,
+                    result.done,
                     result.levels_completed / MAX_SCORE,
                     mask,
                 )
@@ -639,7 +679,10 @@ class Trainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
             "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
-            "return_norm_scale": self.return_normalizer.state_dict(),
+            "return_norm_scales": {
+                "ext": self.return_normalizer_ext.state_dict(),
+                "int": self.return_normalizer_int.state_dict(),
+            },
             "env_steps": self.env_steps,
             "grad_steps": self.grad_steps,
         }

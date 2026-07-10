@@ -9,6 +9,13 @@ Step convention (matches `WorldModel.forward_sequence`'s docstring): step t's
 `action_type`/`coords` are the action that *produced* `frame[t]` (the
 prev_action-at-t convention), so an episode's first step has a placeholder
 action and `is_first[0] = True`.
+
+`sample`'s `reward_frac`/`loss_offset` (tickets/0005) stratify a target
+fraction of each batch toward windows whose loss window contains a
+nonzero-reward step -- reward events are rare (~0.015% of steps in Run 3)
+and otherwise dilute under plain uniform sampling as the buffer grows. The
+event index is derived from `Episode.rewards` at sample time, not stored --
+`save`/`load` need no schema change.
 """
 import random
 from dataclasses import dataclass, field
@@ -121,7 +128,49 @@ class ReplayBuffer:
         frames = [episode.frames[max(i, 0)] for i in range(t - K + 1, t + 1)]
         return torch.stack(frames, dim=0)
 
-    def sample(self, batch_size: int, seq_len: int) -> dict[str, torch.Tensor]:
+    def _reward_events(self, eligible: list[Episode]) -> list[tuple[Episode, int]]:
+        """Scan every eligible episode's rewards for nonzero-reward step
+        indices. O(total_steps) per call -- fine at current buffer scale
+        (tickets/0005); cache per-Episode indices only if profiling ever
+        says otherwise."""
+        events = []
+        for episode in eligible:
+            for t, r in enumerate(episode.rewards):
+                if r != 0.0:
+                    events.append((episode, t))
+        return events
+
+    def _window_idxs(self, episode: Episode, start: int, seq_len: int) -> list[int]:
+        """Contiguous window [start, start+span) clipped to the episode,
+        padded by repeating the last step if the episode is shorter than
+        seq_len (same convention as plain uniform sampling)."""
+        n = len(episode)
+        span = min(seq_len, n - start)
+        idxs = list(range(start, start + span))
+        if len(idxs) < seq_len:
+            idxs += [idxs[-1]] * (seq_len - len(idxs))
+        return idxs
+
+    def _row_idxs_uniform(self, episode: Episode, seq_len: int) -> list[int]:
+        n = len(episode)
+        span = min(seq_len, n)
+        start = random.randint(0, n - span)
+        return self._window_idxs(episode, start, seq_len)
+
+    def _row_idxs_for_event(self, episode: Episode, event_t: int, seq_len: int, loss_offset: int) -> list[int]:
+        """Choose a window start so `event_t`'s index within the window is
+        uniform over [loss_offset, seq_len - 1], clamped to stay in-bounds.
+        When clamping would push the event before `loss_offset` (event too
+        close to episode start), the row just degrades gracefully into a
+        near-start window -- no special-casing."""
+        n = len(episode)
+        offset_in_window = random.randint(loss_offset, seq_len - 1)
+        start = max(0, min(event_t - offset_in_window, max(n - seq_len, 0)))
+        return self._window_idxs(episode, start, seq_len)
+
+    def sample(
+        self, batch_size: int, seq_len: int, reward_frac: float = 0.0, loss_offset: int = 0
+    ) -> dict[str, torch.Tensor]:
         """Returns tensors shaped for `WorldModel.forward_sequence` /
         `compute_losses`:
           observations: (B, T, K, H, W) int64
@@ -138,27 +187,36 @@ class ReplayBuffer:
         shorter than seq_len are padded by repeating their last step
         (is_first correctly marks only the true start, so padded steps are
         just harmless repeats of the terminal transition).
+
+        reward_frac: target fraction of the batch (tickets/0005) drawn from
+        windows whose loss window (the trailing `seq_len - loss_offset`
+        steps, i.e. indices [loss_offset, seq_len)) contains a
+        nonzero-reward step -- reward events are rare and otherwise dilute
+        as the buffer grows. A target, not a promise: falls back to fully
+        uniform sampling if the buffer has no reward events yet.
+        loss_offset: number of leading burn-in steps in each window; a
+        reward event must land at index >= loss_offset to count as "in the
+        loss window".
         """
         eligible = [ep for ep in self.episodes if len(ep) >= 1]
         if not eligible:
             raise ValueError("cannot sample from an empty buffer")
+
+        events = self._reward_events(eligible) if reward_frac > 0 else []
+        num_event_rows = round(batch_size * reward_frac) if events else 0
 
         weights = [len(ep) for ep in eligible]
         obs_batch, type_batch, coord_batch = [], [], []
         first_batch, reward_batch, term_batch, state_batch, game_batch = [], [], [], [], []
         avail_batch = []
 
-        for _ in range(batch_size):
-            episode = random.choices(eligible, weights=weights, k=1)[0]
-            n = len(episode)
-            span = min(seq_len, n)
-            start = random.randint(0, n - span)
-            idxs = list(range(start, start + span))
-            if span < seq_len:
-                # short episode: pad by repeating the last step (safe --
-                # padded steps sit past all real content and are just
-                # extra transitions the loss trains on, no leakage).
-                idxs += [idxs[-1]] * (seq_len - span)
+        for i in range(batch_size):
+            if i < num_event_rows:
+                episode, event_t = random.choice(events)
+                idxs = self._row_idxs_for_event(episode, event_t, seq_len, loss_offset)
+            else:
+                episode = random.choices(eligible, weights=weights, k=1)[0]
+                idxs = self._row_idxs_uniform(episode, seq_len)
 
             obs_batch.append(torch.stack([self._stack(episode, t) for t in idxs], dim=0))
             type_batch.append(torch.tensor([episode.action_types[t] for t in idxs], dtype=torch.long))
