@@ -1325,4 +1325,242 @@ resume artifacts or steady-state properties of the current objective.
 
 ## Findings
 
+(Filled in July 10, evening, from the run's TB scalars, samples, and
+checkpoint after completion. The pre-registered **final full 25-game
+`eval.py` sweep has not been run yet** — the three tickets/0009 numbers
+below are read from the 9 periodic 1-episode-per-game evals and are
+interim until that sweep lands. A stray `eval_60000.json` in the run dir
+is a manual single-episode smoke run of `eval.py` against the 60k
+checkpoint (one cd82 greedy episode, 20 steps, 0 score), not a protocol
+sweep.)
+
+**Run completed:** env_steps=100000, grad_steps=49,500, ~5.6 env steps/s
+(≈5h compute across 4 kill/resume cycles — 5 TB event files with
+continuous counters, no discontinuities). **No contamination:** only the
+20 train games ever appear in `online/*` and `wm/disagreement_by_game/*`;
+the 5 held-out games appear only under `eval/*`. Ugly #1 did not fire.
+
+**Headline (interim): zero-shot transfer is essentially zero — but the
+pre-registered Bad-#1 "memorizes" verdict cannot be cleanly issued,
+because its premise (train-set learning healthy) failed on the scoring
+axis.** Two findings, in tension:
+
+- **Held-out eval: all-zero on final score, every checkpoint.**
+  `eval/{greedy,sampled}/score/*` is 0.00 for all 5 held-out games at all
+  9 eval points (10k–95k), both modes; zero wins. One nuance the scalars
+  almost hide: `eval/sampled/games_scored` reads **1** at 85k and 95k
+  while every per-game score reads 0 — `games_scored` counts a finite
+  `steps_to_first_score` (any transient nonzero-reward event) while
+  `score/<game>` logs *final* `levels_completed`, so one held-out game
+  had a scoring event under sampled play late in training and then lost
+  the level again before the episode ended. TB doesn't record which game.
+  At 1 episode/game this is at noise level; the full sweep must settle it.
+- **The from-scratch train-set arc did not rediscover Runs 4–6's scoring
+  — pre-registered Ugly #2, half-fired.** Exactly **one** scoring episode
+  in the entire run: sp80 at env ~40.5k. lp85 — a live scorer in Runs
+  5–6 (3-of-5 episodes in Run 6's span) — never scored in 12 collection
+  episodes; nothing else scored either, and `online/win_rate/*` stayed 0.
+  So Runs 4–6's scoring competence was leaning on the warm-start lineage
+  (Run 3's world model + accumulated on-objective buffer) harder than
+  believed. Until a from-scratch run scores on *training* games at
+  Run 6's rate, "held-out all-zero" is evidence about exploration/sample
+  budget, not yet about macro-context memorization vs. inference.
+
+**The world model itself is healthy from scratch** — Ugly #2's
+model-side clauses did not fire: `loss/recon` median 0.057 → 0.0066 by
+45k+ (final logged batch 0.0022), recon samples near pixel-perfect,
+imagination samples from 15k on hold game identity and structure across
+the full horizon on visually distinct games. `kl_raw` 0.045 → 0.019
+(straddling the ~0.031 per-dim floor), `train/grad_norm` settling ~0.2,
+no NaN/inf. `wm/disagreement_mean` 0.012 → 0.0022 with per-game
+structure — alive, same depletion shape as Runs 3–6.
+
+**The tickets/0006 objective held from step 0, not just post-resume**
+(the Good-#1 clause it owned): `policy/dream_score_sum` bounded below 1
+for ~99% of grad steps (tail median ~0.5; brief single-batch transients,
+max 4.48, always immediately recovered), `value_ext_mean` never above
+0.6, `return_norm_scale_ext` settling ~1.0. The stratified sampler
+engaged off a **single** real event: `train/reward_windows_in_batch`
+went 0 → 4 at grad step 19,750, immediately after sp80's lone scoring
+episode completed (env 40,553 ≈ grad ~19.8k), and held 4/16 for the
+remaining ~30k grad steps — the whole late-run ext stream (scale_ext
+0.10 → 1.03, value_ext 0.01 → ~0.38) is powered by one episode.
+
+**Watch items from Run 6, now with a from-scratch data point:**
+
+- `policy/entropy`: ran ~2.9–3.1 early, dipped hard exactly when ext
+  advantages arrived (~grad 20k; 8 logged points under 0.5, min 0.32),
+  self-recovered to ~2.0–2.3, ending ~2.7. The <0.3-sustained trigger
+  never fired; no action-type frac above 0.25. Run 6's "hot" 3.7–4.3
+  tail looks like a resume artifact; ~2 nats is the steady state.
+- `return_norm_scale_int`: rose 1.3 → ~9.1 by 15k, then *decayed* to
+  ~5 — Run 6's upward drift is not a from-scratch property and not
+  runaway. Keep as a passive watch item.
+- New: `online/macro_context_norm` runs much hotter from scratch —
+  median ~12 over the first 15k env steps (max 67 at env ~2.3k) before
+  decaying to Run 3's ~1.7–2 band by 60k+. Early-training `m` is
+  large and unregularized exactly when the held-out eval exercises it
+  out-of-distribution; worth remembering when reading early eval points.
+
+**Decision (interim, pending the final sweep):** neither pre-registered
+exit fires cleanly. The zero-shot answer so far is "no transfer
+observed, one ambiguous transient" — but the run's own train-set scoring
+regression (Ugly #2, half-fired) means the memorize-vs-infer question is
+confounded by exploration/sample budget. Both readings point the same
+way as Bad #1's prescribed response anyway: **prioritize test-time
+adaptation (tickets/0010, `adapt.py` — already in flight) over zero-shot
+hope**, and treat the from-scratch scoring shortfall as its own open
+question (warm-start lineage vs. budget) rather than rerunning this
+protocol bigger. Before closing this entry: run the pre-registered
+`uv run python eval.py --checkpoint runs/held_out_v1/latest.pt` and
+append its 25-game table here.
+
+### Final full sweep (July 10, evening — `eval_100000.json`, 250 episodes)
+
+The full 25-game × 5-episode × both-modes protocol, closing this entry.
+Scoring rows only (all 42 other game×mode rows are 0.00 across the board,
+zero wins anywhere):
+
+```
+game         mode     mean_score max_score win_rate mean_len steps_to_1st
+sp80         greedy         0.00         0     0.00    600.0         18.6
+  -> games_scored=1 games_won=0 (greedy)
+cd82         sampled        0.40         1     0.00    196.2         79.5
+r11l         sampled        0.00         0     0.00    600.0        229.0
+sp80         sampled        0.00         0     0.00    600.0         16.2
+  -> games_scored=3 games_won=0 (sampled)
+```
+
+Three refinements to the interim reading above:
+
+- **The one nonzero final score in the whole table is on a held-out
+  game.** cd82 (never trained on) completes a level and *keeps* it in
+  2 of 5 sampled episodes (first scores at steps 20 and 139). r11l
+  (also held-out) has transient scoring events in 2 of 5 sampled
+  episodes (~steps 222/236) but ends both at 0. This resolves the
+  85k/95k `games_scored=1` mystery — it was cd82/r11l's transient-or-
+  retained sampled scoring, invisible in the final-levels scalar.
+  **Caveat before calling it transfer:** cd82/r11l were held out
+  precisely because incidental play can score them (Run 3 precedent),
+  greedy scores 0 on both, and the "beats random play" bar
+  pre-registered above hasn't been checked against a random baseline —
+  so this is a glimmer, not a claim.
+- **The train-set regression is confirmed and worse than the collection
+  scalars suggested — pre-registered Bad #2 fired.** Zero final score
+  on all 20 train games in both modes (Run 6's checkpoint: 4 games
+  scored greedy, lp85/sp80 at mean 1.00). sp80 scores a level within
+  ~18 steps in *all 10* of its episodes, both modes, then loses it and
+  rides the 600-step cap every time (it also no longer terminates
+  naturally — Runs 1–6's only natural terminator). lp85: nothing, 10/10.
+- Net: the from-scratch/warm-start confound now dominates the
+  tickets/0009 question. The zero-shot table exists (all-but-zero, one
+  sampled-mode glimmer on cd82), which is exactly the precondition
+  tickets/0009's non-goals set for prioritizing test-time adaptation.
+  **Proceed to Run 8 (tickets/0010, `adapt.py`) on this checkpoint**,
+  whose frozen-eval cells double as a reproduction check of this table.
+
+---
+
+# Run 8 — tickets/0010 test-time adaptation on the held-out games (July 10, 2026, overnight)
+
+Runs on Run 7's checkpoint: its zero-shot table (`eval_100000.json`,
+appended above) is the baseline this run exists to beat. Per game, per
+tickets/0010: eval the frozen checkpoint (carry off/on), warm-start a
+fresh single-game `Trainer` from its **full** weights
+(`init_from_full` — world model + policy + both critics; fresh
+optimizers/normalizers/buffer), train for a fixed 20k-env-step budget
+(500 random prefill included), eval the adapted weights (carry off/on),
+and write `<output_dir>/<game>/adapt_report.json` with all four cells
+plus `env_steps_to_first_score`. The novelty guard reads the source
+checkpoint's `train_games` and refuses any game in it — all five targets
+here are the held-out set, so it must pass silently.
+
+Two pre-registered questions (tickets/0010 Step 7): **(1)** does 20k
+steps of test-time training beat zero-shot where scoring is known
+reachable (cd82/r11l — the headline; cd82's frozen sampled 0.40 is the
+number to beat)? **(2)** does carried `m` (Arm A) help or hurt, and does
+the answer differ between frozen and adapted weights?
+
+```sh
+# Ticket 0010 Step 7's pre-registered command, as written. Defaults:
+# budget=20000, prefill=500, eval-every=5000, episodes-per-game=5.
+# Resume is automatic per game: rerunning picks each <game>/ dir up
+# from its latest.pt, so an interrupted overnight run just continues.
+uv run python adapt.py \
+  --checkpoint runs/held_out_v1/latest.pt \
+  --games cd82 r11l ft09 sk48 wa30 \
+  --output-dir runs/adapt_v1
+```
+
+Budget arithmetic: 5 games × 20k adaptation steps ≈ 100k env steps ≈ 5h
+at Run 3+'s ~5.5 steps/s, plus eval cells (per game: 4 cells × 2 modes ×
+5 episodes × ≤600 steps ≈ up to 24k interactions) and the in-adaptation
+`eval_every=5000` curve — call it 8–12h wall-clock. An overnight run;
+if it must be cut short, completed games have full reports (per-game
+loop), so partial results are still readable.
+
+## What to Look for
+
+Read each game's `adapt_report.json` as a 2×2 (frozen/adapted × carry
+off/on); TB per game under `runs/adapt_v1/<game>/tb`.
+
+**Good:**
+
+- **Sanity anchor first:** each game's frozen, carry-off cell reproduces
+  Run 7's `eval_100000.json` rows for that game (same weights, protocol,
+  seed). Any large disagreement is an `init_from_full`/plumbing bug and
+  invalidates the rest of that game's report — check this before reading
+  anything else.
+- **The headline (Q1):** adapted beats frozen on cd82 and/or r11l —
+  greedy going nonzero (frozen greedy is 0.00 everywhere), sampled
+  mean_score above cd82's 0.40, `env_steps_to_first_score` well inside
+  the 20k budget, and the `eval_every=5000` in-adaptation curve rising
+  rather than flat. Any of these on ft09/sk48/wa30 (no known scoring
+  path) would be a stronger, unexpected win.
+- **Q2 answered either way:** carry-on cells measurably differ from
+  carry-off (helping *or* hurting is informative; Arm A is a measured
+  ablation, pre-registered as such). No crashes/NaN from `m` running
+  out-of-distribution across episode resets — note Run 7's finding that
+  early-training `m` norms run hot.
+- **Adaptation internals healthy on a single game:** recon falling
+  further from the warm start, `dream_score_sum` bounded < 1,
+  fresh normalizer scales re-estimating within a few hundred grad steps,
+  no NaN/inf. Novelty guard silent on all five games; each game's buffer
+  contains only that game.
+
+**Bad (report as negative result, don't knob-tune):**
+
+- Adapted ≈ frozen across all four cells on cd82/r11l — 20k steps is too
+  small a budget or single-game data too thin for the current objective;
+  the next lever is budget or an adaptation-specific objective
+  (intrinsic_scale annealing), decided in a follow-up ticket, not here.
+- Adaptation *degrades* cd82's frozen sampled 0.40 — plausible failure:
+  the intrinsic-dominated objective steers the policy away from the
+  scoring behavior it already had. Would directly motivate down-weighting
+  intrinsic reward at test time; capture the per-cell numbers as the
+  evidence.
+- ft09/sk48/wa30 all-zero in every cell — expected-ish (no known scoring
+  path); log it as the difficulty read on the harder unknowns.
+
+**Ugly (stop and investigate):**
+
+- The frozen-cell sanity anchor fails (see Good #1) — `init_from_full`
+  is not faithfully restoring the agent; nothing downstream is readable.
+- The novelty guard fails open (runs a trained game without
+  `--allow-trained-game`) or any adaptation buffer contains another
+  game's episodes — contamination; the run is unsalvageable as designed.
+- NaN/instability shortly after adaptation starts — suspect the fresh
+  return normalizers meeting the warm critics (the one deliberately
+  fresh/warm seam in `init_from_full`).
+
+Decision this run should produce, pre-committed: if adapted > frozen on
+either known-reachable game, tickets/0010 validates and test-time
+adaptation becomes the default eval story (follow-up: budget scaling,
+intrinsic annealing). If flat everywhere, the negative result plus
+Run 7's from-scratch scoring regression together say the *training-time*
+policy/exploration gap is the binding constraint — go back there before
+buying more adaptation machinery.
+
+## Findings
+
 (to be filled at run end — or mid-run if a pre-registered exit fires)

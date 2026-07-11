@@ -416,6 +416,22 @@ still measures the held-out games zero-shot. Such a run must train from scratch 
 every pre-0009 checkpoint saw all 25 games, so warm-starting bakes held-out dynamics
 into the weights undetectably.
 
+**Test-time adaptation** (tickets/0010) adds two mechanisms on top of the zero-shot
+floor and the fixed protocol that measures them, `adapt.py`. Arm A is `carry_macro_context`
+(a new `EvalProtocol` field): `evaluate` builds one `OnlineActor` per (game, mode) instead
+of one per episode, letting `m` persist across a game's `episodes_per_game` episodes
+instead of resetting every episode — off by default, and structurally scoped so carry
+can never leak across a game or mode boundary regardless of the flag. Arm B is test-time
+training: `adapt.py` copies a source checkpoint's *entire* weights (world model + policy
++ both critics, via `TrainerConfig.init_from_full`) into a fresh single-game `Trainer` run
+(its own output dir, its own fresh buffer, fixed env-step budget), then runs `evaluate`
+before vs. after. A novelty guard refuses to adapt on a game the source checkpoint's
+`train_games` already covered (or an empty/missing list, meaning it trained on
+everything) — adapting on a trained game would silently measure continued training, not
+test-time adaptation. Each game's report has four eval cells (frozen/adapted ×
+carry off/on) plus `env_steps_to_first_score`, the closest analog of the competition's
+actual budget metric.
+
 ### 4.8 Telemetry
 
 TensorBoard under `<output_dir>/tb`: `loss/*` (world model), `policy/*` (actor-critic,
@@ -457,15 +473,21 @@ gets a `TRAINING_LOG.md` entry: command, pre-registered expectations, findings.
 Gaps between what exists and what an actual ARC-AGI-3 submission needs. Roughly
 ordered by how load-bearing they are.
 
-1. **Test-time adaptation / cross-episode learning on a novel game.** The benchmark's
-   premise is *learning efficiency on unseen games*, but at eval time Thumper is
-   frozen: `evaluate` builds a fresh `OnlineActor` per episode, so even the
-   macro-context — the one mechanism designed to infer a game's rules — is thrown away
-   between episodes of the *same* game. Nothing improves across the episode budget: no
-   carried `m`, no gradient steps on eval experience, no episodic memory of what was
-   tried. Held-out eval today measures pure zero-shot transfer, which is a floor, not
-   the benchmark's actual target. (Flagged in the July 2026 tech-lead review as the
-   top un-ticketed follow-up.)
+1. **~~Test-time adaptation / cross-episode learning on a novel game~~ (tickets/0010,
+   partial).** The benchmark's premise is *learning efficiency on unseen games*; Thumper
+   used to be frozen at eval time in every sense. Two mechanisms now exist: carrying the
+   macro-context `m` across a game's episodes during eval (`EvalProtocol.carry_macro_context`,
+   an off-by-default ablation since the TaskEncoder has only ever been trained within a
+   single episode's burn-in), and per-game test-time training (`adapt.py`: full-weight
+   warm start into a fresh single-game `Trainer` run, measured before/after against the
+   0009 zero-shot baseline). What's still missing: no episodic memory of what was tried
+   within an adaptation run beyond what gradient steps encode (Missing Feature #5), and
+   no decision-time use of the world model during or after adaptation (Missing Feature
+   #2) — test-time training only ever improves the reactive policy, never searches. The
+   pre-registered adaptation run (tickets/0010 Step 7) is the first real data on whether
+   20k steps of test-time training beats zero-shot at all; a null result there points
+   directly at #2 as the next necessary mechanism. (Flagged in the July 2026 tech-lead
+   review as the top un-ticketed follow-up.)
 2. **No decision-time planning.** The world model is only ever used for training-time
    imagination; at act time the policy is a single reactive forward pass. The entire
    point of having a dynamics model at test time — rolling candidate action sequences
@@ -481,7 +503,9 @@ ordered by how load-bearing they are.
    16-step burn-in; online play accumulates it over episodes up to 600 steps. The
    TaskEncoder is never trained on the long-horizon regime it is actually used in
    (tickets/0002's remaining follow-up; `online/macro_context_norm`'s early spike in
-   Run 7 — max ~67 vs O(1) later — is this mismatch showing up live).
+   Run 7 — max ~67 vs O(1) later — is this mismatch showing up live). Tickets/0010's
+   Arm A (carrying `m` across episode resets during eval) is a stronger version of the
+   same mismatch, honestly measured as an ablation rather than assumed to help.
 5. **Exploration has no episodic novelty term.** Ensemble disagreement is *global*
    novelty — it decays permanently as the model learns, and it cannot tell "I haven't
    tried this yet *this episode*" from "I've never tried this". Sparse multi-step

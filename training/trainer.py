@@ -161,9 +161,18 @@ class TrainerConfig:
     resume: bool = True
     """Pick up from output_dir/latest.pt (and buffer.pt) if present."""
     init_from: str = ""
-    """Checkpoint path to warm-start *world-model weights only* from, used
-    only when `resume` finds nothing: fresh optimizer/counters/buffer, so
-    it seeds a new run from prior work rather than resuming it."""
+    """Checkpoint path to warm-start from, used only when `resume` finds
+    nothing: fresh optimizer/counters/buffer either way, so it seeds a new
+    run from prior work rather than resuming it. Warm-starts *world-model
+    weights only* unless `init_from_full` is set."""
+    init_from_full: bool = False
+    """With `init_from` set, load the checkpoint's *entire* Thumper state
+    (world model + policy + both critics + critic target) and adopt its
+    saved ThumperConfig, instead of world-model weights only -- optimizers/
+    counters/buffer stay fresh either way. Used by test-time adaptation
+    (tickets/0010, `adapt.py`) so an adaptation run starts from the full
+    trained agent, not just its dynamics model. Setting this without
+    `init_from` is a config error."""
 
     seed: int = 0
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
@@ -190,6 +199,8 @@ class Trainer:
     def __init__(self, config: TrainerConfig | None = None):
         self.config = config or TrainerConfig()
         c = self.config
+        if c.init_from_full and not c.init_from:
+            raise ValueError("init_from_full=True requires init_from to be set.")
         random.seed(c.seed)
         torch.manual_seed(c.seed)
 
@@ -222,6 +233,18 @@ class Trainer:
                     f"silently re-keys buffered episodes' game_id and can leak held-out data into "
                     f"training. Start a fresh --config.output-dir instead."
                 )
+
+        # init_from_full also decides the architecture (the checkpoint's
+        # saved ThumperConfig, same as resume) since the loaded state_dict
+        # is the *entire* Thumper, not just the world model -- must happen
+        # before Thumper(c.thumper) is constructed below. Only consulted
+        # when resume found nothing (payload is None): a resumed run never
+        # re-warm-starts.
+        init_payload = None
+        if payload is None and c.init_from:
+            init_payload = torch.load(c.init_from, map_location=c.device, weights_only=False)
+            if c.init_from_full:
+                c.thumper = init_payload["config"]
 
         self.thumper = Thumper(c.thumper).to(c.device)
         self.actor_state = OnlineActor(self.thumper, c.device)
@@ -264,19 +287,27 @@ class Trainer:
                 f"grad_steps={self.grad_steps}, buffer={self.buffer.total_steps} steps."
             )
         elif c.init_from:
-            # Warm start: only the world model's weights -- no optimizer
-            # state, no counters, no buffer. A fresh run seeded from prior
-            # work, not a resume (a crashed run resumes its own progress
-            # above, never re-warm-starts).
-            init_payload = torch.load(c.init_from, map_location=c.device, weights_only=False)
-            prefix = "world_model."
-            world_model_state = {
-                k.removeprefix(prefix): v
-                for k, v in init_payload["state_dict"].items()
-                if k.startswith(prefix)
-            }
-            self.thumper.world_model.load_state_dict(world_model_state)
-            print(f"Initialized world model weights from {c.init_from} (fresh optimizer/counters/buffer).")
+            # Warm start: no optimizer state, no counters, no buffer either
+            # way -- a fresh run seeded from prior work, not a resume (a
+            # crashed run resumes its own progress above, never
+            # re-warm-starts). init_payload was already loaded above (before
+            # Thumper construction) since the full-weights mode needs its
+            # ThumperConfig first.
+            if c.init_from_full:
+                self.thumper.load_state_dict(init_payload["state_dict"])
+                print(
+                    f"Initialized full Thumper weights (world model + policy + critics) from "
+                    f"{c.init_from} (fresh optimizer/counters/buffer)."
+                )
+            else:
+                prefix = "world_model."
+                world_model_state = {
+                    k.removeprefix(prefix): v
+                    for k, v in init_payload["state_dict"].items()
+                    if k.startswith(prefix)
+                }
+                self.thumper.world_model.load_state_dict(world_model_state)
+                print(f"Initialized world model weights from {c.init_from} (fresh optimizer/counters/buffer).")
 
     # --- game round-robin -------------------------------------------------
 

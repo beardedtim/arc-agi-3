@@ -36,7 +36,13 @@ class OnlineActor:
 
     One instance drives one episode at a time; call `begin_episode` again to
     reset onto a new one (a fresh instance is just as valid -- state is
-    reconstructed from a first frame, not carried across episodes).
+    reconstructed from a first frame, not carried across episodes) unless
+    `begin_episode(carry_macro_context=True)` is used, in which case the
+    macro-context `m` survives the reset while everything else (frame stack,
+    RSSM state, pending fold) still resets -- an opt-in eval-only ablation
+    (tickets/0010 Arm A) scoped by the caller to one (game, mode) block; a
+    fresh instance's first `begin_episode` behaves identically regardless of
+    the flag, since there is no prior `m` to carry.
     """
 
     def __init__(self, thumper: Thumper, device: str):
@@ -50,20 +56,29 @@ class OnlineActor:
         self._pending_action_onehot: torch.Tensor | None = None
         self._pending_reward: torch.Tensor | None = None
 
-    def begin_episode(self, first_frame: torch.Tensor) -> None:
+    def begin_episode(self, first_frame: torch.Tensor, carry_macro_context: bool = False) -> None:
         """Reset the per-episode latent state from an episode's first frame:
         frame-stack deque (K copies of it), RSSM initial_state, TaskEncoder
         initial_state, and a zeroed previous action -- mirrors
         forward_sequence's is_first convention (no real action produced the
         first observation). The pending TaskEncoder fold is seeded zeroed
         too, so the first `act()` performs the same zero-fold on the first
-        observation that training's burn-in performs at an is_first step."""
+        observation that training's burn-in performs at an is_first step.
+
+        carry_macro_context: when True and a previous episode already ran
+        (self._macro_context is not None), leave the macro-context as-is
+        instead of resetting it to task_encoder.initial_state -- the slow
+        task belief survives the reset while the frame stack, RSSM state,
+        and pending fold (all episode-scoped by definition) still reset
+        (tickets/0010 Arm A). A first-ever call behaves identically to
+        False, since there is no prior `m` to carry."""
         wm = self.thumper.world_model
         device = self.device
         K = wm.config.frame_stack
         self._frame_stack = deque([first_frame] * K, maxlen=K)
         self._deter, self._stoch = wm.rssm.initial_state(1, device)
-        self._macro_context = wm.task_encoder.initial_state(1, device)
+        if not (carry_macro_context and self._macro_context is not None):
+            self._macro_context = wm.task_encoder.initial_state(1, device)
         self._prev_action_onehot = torch.zeros(1, wm.config.action_dim, device=device)
         self._pending_action_onehot = torch.zeros(1, wm.config.action_dim, device=device)
         self._pending_reward = torch.zeros(1, 1, device=device)

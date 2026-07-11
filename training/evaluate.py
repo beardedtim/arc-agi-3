@@ -38,6 +38,12 @@ class EvalProtocol:
     max_steps: int = 600
     modes: tuple[str, ...] = ("greedy", "sampled")
     seed: int = 0
+    carry_macro_context: bool = False
+    """Reuse one OnlineActor per (game, mode), carrying the macro-context
+    `m` across that game's episodes instead of resetting it every episode
+    (tickets/0010 Arm A) -- measures whether the task belief built in
+    episode 1 helps episode 2+. Off by default, which preserves 0007/0009
+    semantics exactly (a fresh actor per episode)."""
 
 
 @dataclass
@@ -147,9 +153,20 @@ def evaluate(thumper: Thumper, env: Env, protocol: EvalProtocol) -> EvalReport:
                 random.seed(protocol.seed)
                 torch.manual_seed(protocol.seed)
                 for game in games:
+                    # One actor per (game, mode): with carry off this is
+                    # behaviorally identical to a fresh actor per episode
+                    # (begin_episode fully resets state either way); with
+                    # carry on, m persists across this game's episodes but
+                    # can never leak into another game or mode, since the
+                    # actor itself doesn't either (tickets/0010 Design
+                    # principle 3 -- structural, not conditional).
+                    actor = OnlineActor(thumper, str(device))
                     for _ in range(protocol.episodes_per_game):
                         report.episodes.append(
-                            _run_episode(thumper, env, game, mode, greedy, protocol.max_steps, device)
+                            _run_episode(
+                                actor, env, game, mode, greedy, protocol.max_steps,
+                                carry_macro_context=protocol.carry_macro_context,
+                            )
                         )
     finally:
         thumper.train(was_training)
@@ -157,11 +174,11 @@ def evaluate(thumper: Thumper, env: Env, protocol: EvalProtocol) -> EvalReport:
 
 
 def _run_episode(
-    thumper: Thumper, env: Env, game: str, mode: str, greedy: bool, max_steps: int, device
+    actor: OnlineActor, env: Env, game: str, mode: str, greedy: bool, max_steps: int,
+    carry_macro_context: bool = False,
 ) -> EvalEpisode:
-    actor = OnlineActor(thumper, str(device))
     result = env.reset(game)
-    actor.begin_episode(result.frame)
+    actor.begin_episode(result.frame, carry_macro_context=carry_macro_context)
 
     steps_to_first_score: int | None = None
     length = 0

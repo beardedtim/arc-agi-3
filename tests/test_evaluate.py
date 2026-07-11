@@ -204,6 +204,57 @@ class TestOnlineActorRefactorEquivalence:
         assert trainer_actions == actor_actions
 
 
+class TestMacroContextCarry:
+    """tickets/0010 Arm A: begin_episode(carry_macro_context=True) preserves
+    the TaskEncoder's macro-context across an episode reset instead of
+    reinitializing it, while everything else (frame stack, RSSM state,
+    pending fold) still resets."""
+
+    def _thumper(self, tmp_path):
+        return Trainer(
+            TrainerConfig(thumper=small_config(), output_dir=str(tmp_path), resume=False, device="cpu")
+        ).thumper
+
+    def test_first_ever_call_with_carry_equals_zero_initial_state(self, tmp_path):
+        thumper = self._thumper(tmp_path)
+        actor = OnlineActor(thumper, "cpu")
+        actor.begin_episode(_frame(0), carry_macro_context=True)
+
+        zero_state = thumper.world_model.task_encoder.initial_state(1, "cpu")
+        assert torch.equal(actor._macro_context, zero_state)
+
+    def test_carry_preserves_macro_context_across_reset(self, tmp_path):
+        thumper = self._thumper(tmp_path)
+        actor = OnlineActor(thumper, "cpu")
+        actor.begin_episode(_frame(0))
+        for t in range(1, 4):
+            actor.act([RESET, 1, 2], greedy=True)
+            actor.observe(1, (0, 0), 1.0, _frame(t))
+
+        assert actor.macro_context_norm > 0.0
+        macro_context_before = actor._macro_context.clone()
+
+        actor.begin_episode(_frame(0), carry_macro_context=True)
+        assert torch.equal(actor._macro_context, macro_context_before)
+        # everything else episode-scoped does reset
+        assert len(actor._frame_stack) == thumper.world_model.config.frame_stack
+        assert all(torch.equal(f, _frame(0)) for f in actor._frame_stack)
+
+    def test_carry_off_resets_to_zero_initial_state(self, tmp_path):
+        thumper = self._thumper(tmp_path)
+        actor = OnlineActor(thumper, "cpu")
+        actor.begin_episode(_frame(0))
+        for t in range(1, 4):
+            actor.act([RESET, 1, 2], greedy=True)
+            actor.observe(1, (0, 0), 1.0, _frame(t))
+
+        assert actor.macro_context_norm > 0.0
+
+        actor.begin_episode(_frame(0), carry_macro_context=False)
+        zero_state = thumper.world_model.task_encoder.initial_state(1, "cpu")
+        assert torch.equal(actor._macro_context, zero_state)
+
+
 class TestEvaluate:
     def _protocol(self, **overrides) -> EvalProtocol:
         overrides.setdefault("games", ["g1", "g2"])
@@ -290,6 +341,59 @@ class TestEvaluate:
             for game in protocol.games:
                 assert game in table
             assert mode in table
+
+    def test_carry_off_matches_pre_refactor_behavior(self, tmp_path):
+        """tickets/0010: the Step 2 refactor (one OnlineActor per (game,
+        mode) instead of one per episode) must be bit-identical to the old
+        per-episode-actor behavior when carry_macro_context is off, since
+        begin_episode fully resets state either way."""
+        thumper = self._thumper(tmp_path)
+        env = ScriptedEnv(
+            {
+                "g1": [(0.0, False, False)] * 5 + [(1.0, True, True)],
+                "g2": [(0.0, False, False)] * 10,
+            }
+        )
+        protocol = self._protocol(carry_macro_context=False)
+
+        report1 = evaluate(thumper, env, protocol)
+        report2 = evaluate(thumper, env, protocol)
+
+        assert report1.to_json() == report2.to_json()
+
+    def test_carry_never_crosses_game_or_mode(self, tmp_path, monkeypatch):
+        """tickets/0010 Design principle 3: with carry_macro_context=True,
+        evaluate must construct exactly one OnlineActor per (game, mode) --
+        never share one across games or modes -- and pass carry=True to
+        every begin_episode call. 2 games x 2 modes -> 4 constructions."""
+        thumper = self._thumper(tmp_path)
+        env = ScriptedEnv(
+            {"g1": [(0.0, False, False)] * 5, "g2": [(0.0, False, False)] * 5}
+        )
+        protocol = self._protocol(games=["g1", "g2"], episodes_per_game=2, max_steps=5, carry_macro_context=True)
+
+        construction_count = 0
+        carry_flags = []
+        orig_init = OnlineActor.__init__
+        orig_begin_episode = OnlineActor.begin_episode
+
+        def counting_init(self, *args, **kwargs):
+            nonlocal construction_count
+            construction_count += 1
+            return orig_init(self, *args, **kwargs)
+
+        def recording_begin_episode(self, first_frame, carry_macro_context=False):
+            carry_flags.append(carry_macro_context)
+            return orig_begin_episode(self, first_frame, carry_macro_context=carry_macro_context)
+
+        monkeypatch.setattr(OnlineActor, "__init__", counting_init)
+        monkeypatch.setattr(OnlineActor, "begin_episode", recording_begin_episode)
+
+        evaluate(thumper, env, protocol)
+
+        assert construction_count == 4  # 2 games x 2 modes
+        assert len(carry_flags) == 2 * 2 * protocol.episodes_per_game
+        assert all(carry_flags)
 
 
 class TestEvalIsolation:
