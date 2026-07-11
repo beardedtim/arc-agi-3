@@ -3,7 +3,7 @@ warm start, the adapt.py novelty guard, and env_steps_to_first_score. Fast,
 CPU-only, shrunken conftest Thumper -- no real env needed."""
 import torch
 
-from adapt import check_novelty, env_steps_to_first_score
+from adapt import Args, build_trainer_config, check_novelty, env_steps_to_first_score
 from tests.conftest import GRID, STACK, small_config
 from training.replay_buffer import ReplayBuffer
 from training.trainer import Trainer, TrainerConfig
@@ -129,6 +129,25 @@ class TestNoveltyGuard:
             check_novelty("cd82", ["cd82"], allow_trained_game=True)
             assert len(caught) == 1
             assert "cd82" in str(caught[0].message)
+
+
+class TestBuildTrainerConfigAnnealingArm:
+    def test_annealing_arm_carried_through(self):
+        args = Args(
+            checkpoint="ckpt.pt",
+            games=["cd82"],
+            intrinsic_scale=1.0,
+            intrinsic_scale_final=0.0,
+        )
+        cfg = build_trainer_config("ckpt.pt", "cd82", args)
+        assert cfg.intrinsic_scale == 1.0
+        assert cfg.intrinsic_scale_final == 0.0
+
+    def test_defaults_are_constant_scale(self):
+        args = Args(checkpoint="ckpt.pt", games=["cd82"])
+        cfg = build_trainer_config("ckpt.pt", "cd82", args)
+        assert cfg.intrinsic_scale == 1.0
+        assert cfg.intrinsic_scale_final is None
 
 
 class TestEnvStepsToFirstScore:

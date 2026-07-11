@@ -29,6 +29,7 @@ from collections import deque
 import torch
 
 from model.thumper import Thumper
+from training.planner import PlannerConfig, plan
 
 
 class OnlineActor:
@@ -43,11 +44,20 @@ class OnlineActor:
     (tickets/0010 Arm A) scoped by the caller to one (game, mode) block; a
     fresh instance's first `begin_episode` behaves identically regardless of
     the flag, since there is no prior `m` to carry.
+
+    `planner` (tickets/0011, default None) swaps the reactive "sample the
+    policy once" line for decision-time planning (`training/planner.py`),
+    eval-only for now (the collector never passes one). Everything through
+    the TaskEncoder fold is identical either way, and the dream planning
+    performs is grad-free and discarded -- imagined states never touch this
+    actor's real posterior state, so a planning actor and a reactive actor
+    fed the same transitions end with identical latent state.
     """
 
-    def __init__(self, thumper: Thumper, device: str):
+    def __init__(self, thumper: Thumper, device: str, planner: PlannerConfig | None = None):
         self.thumper = thumper
         self.device = device
+        self.planner = planner
         self._frame_stack: deque[torch.Tensor] | None = None
         self._deter: torch.Tensor | None = None
         self._stoch: torch.Tensor | None = None
@@ -93,7 +103,13 @@ class OnlineActor:
         mirrors forward_sequence's per-step ordering exactly (step -> fold ->
         act, both consuming the same arrival state; tickets/0008). Returns
         (action_type, coords, mask) so the caller can store the mask the
-        action was chosen under alongside the resulting step."""
+        action was chosen under alongside the resulting step.
+
+        `greedy` is ignored when `self.planner` is set -- the planner has its
+        own action-selection semantics (Design principle 3: a greedy rollout
+        is always scored as candidate 0), so `evaluate`'s `greedy=False` call
+        for non-greedy modes is a no-op on this branch rather than an
+        assertion failure."""
         wm = self.thumper.world_model
         device = self.device
         stack = torch.stack(list(self._frame_stack), dim=0).unsqueeze(0).to(device)
@@ -109,9 +125,15 @@ class OnlineActor:
             self._macro_context, self._deter, self._stoch, self._pending_action_onehot, self._pending_reward
         )
         mask = self._mask_from_available(available_actions)
-        out = self.thumper.act(
-            self._deter, self._stoch, self._macro_context, mask.unsqueeze(0).to(device), greedy=greedy
-        )
+        mask_batched = mask.unsqueeze(0).to(device)
+        if self.planner is None:
+            out = self.thumper.act(
+                self._deter, self._stoch, self._macro_context, mask_batched, greedy=greedy
+            )
+        else:
+            out = plan(
+                self.thumper, self._deter, self._stoch, self._macro_context, mask_batched, self.planner
+            )
         action_type = int(out["action_type"].item())
         coords = tuple(out["coords"][0].tolist())
         return action_type, coords, mask

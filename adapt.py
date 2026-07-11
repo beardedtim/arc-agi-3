@@ -67,6 +67,12 @@ class Args:
     allow_trained_game: bool = False
     """Override the novelty guard (Design principle 5) for debugging."""
     seed: int = 0
+    intrinsic_scale: float = 1.0
+    """Actor intrinsic-advantage weight at adaptation start (TrainerConfig
+    passthrough)."""
+    intrinsic_scale_final: float | None = None
+    """tickets/0012: if set, anneal intrinsic_scale linearly to this value
+    over the adaptation budget. None = constant (the Run 8 baseline arm)."""
 
 
 def check_novelty(game: str, train_games: list[str], allow_trained_game: bool) -> None:
@@ -116,6 +122,27 @@ def _eval_cell(thumper: Thumper, env: Env, game: str, args: Args, carry_macro_co
     return evaluate(thumper, env, protocol)
 
 
+def build_trainer_config(checkpoint: str, game: str, args: Args) -> TrainerConfig:
+    """Pure construction of the adaptation Trainer's config, factored out of
+    adapt_game so the annealing-arm plumbing (tickets/0012) is unit-testable
+    without running a full adaptation."""
+    game_output_dir = str(Path(args.output_dir) / game)
+    return TrainerConfig(
+        train_games=[game],
+        init_from=checkpoint,
+        init_from_full=True,
+        output_dir=game_output_dir,
+        total_env_steps=args.budget,
+        prefill_steps=args.prefill_steps,
+        eval_every=args.eval_every,
+        eval_games=[game],
+        eval_episodes_per_game=args.episodes_per_game,
+        seed=args.seed,
+        intrinsic_scale=args.intrinsic_scale,
+        intrinsic_scale_final=args.intrinsic_scale_final,
+    )
+
+
 def adapt_game(checkpoint: str, game: str, args: Args) -> dict:
     """Run the full tickets/0010 protocol for one game: novelty guard,
     pre-adaptation (frozen) eval x2 carry settings, adaptation via Trainer,
@@ -134,18 +161,7 @@ def adapt_game(checkpoint: str, game: str, args: Args) -> dict:
 
     print(f"[{game}] adapting: {args.budget} env steps (prefill {args.prefill_steps})...")
     game_output_dir = str(Path(args.output_dir) / game)
-    trainer_config = TrainerConfig(
-        train_games=[game],
-        init_from=checkpoint,
-        init_from_full=True,
-        output_dir=game_output_dir,
-        total_env_steps=args.budget,
-        prefill_steps=args.prefill_steps,
-        eval_every=args.eval_every,
-        eval_games=[game],
-        eval_episodes_per_game=args.episodes_per_game,
-        seed=args.seed,
-    )
+    trainer_config = build_trainer_config(checkpoint, game, args)
     trainer = Trainer(trainer_config)
     trainer.train()
 
@@ -163,6 +179,8 @@ def adapt_game(checkpoint: str, game: str, args: Args) -> dict:
         "budget": args.budget,
         "prefill_steps": args.prefill_steps,
         "seed": args.seed,
+        "intrinsic_scale": args.intrinsic_scale,
+        "intrinsic_scale_final": args.intrinsic_scale_final,
         "env_steps_to_first_score": first_score,
         "eval": {
             "frozen_carry_off": frozen_carry_off.to_json(),

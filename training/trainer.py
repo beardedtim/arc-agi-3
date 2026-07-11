@@ -63,6 +63,17 @@ from training.replay_buffer import Episode, ReplayBuffer
 MAX_SCORE = 254.0
 
 
+def intrinsic_scale_at(
+    initial: float, final: float | None, env_steps: int, total_env_steps: int
+) -> float:
+    """tickets/0012: linear anneal of the actor's intrinsic-advantage
+    weight over the run's env-step budget; final=None disables."""
+    if final is None:
+        return initial
+    frac = min(1.0, env_steps / max(1, total_env_steps))
+    return initial + frac * (final - initial)
+
+
 @dataclass
 class TrainerConfig:
     thumper: ThumperConfig = field(default_factory=ThumperConfig)
@@ -121,7 +132,18 @@ class TrainerConfig:
     critic_lr: float = 8e-5
     intrinsic_scale: float = 1.0
     """Weight on the normalized intrinsic advantage vs the normalized
-    extrinsic advantage (tickets/0005) -- see ActorCriticConfig."""
+    extrinsic advantage (tickets/0005) -- see ActorCriticConfig. Optionally
+    annealed over a run's budget at test time (tickets/0012); see
+    intrinsic_scale_final."""
+    intrinsic_scale_final: float | None = None
+    """If set, the actor's intrinsic_scale anneals linearly from
+    `intrinsic_scale` at env step 0 to this value at `total_env_steps`
+    (clamped there for any overtime steps). None = constant, today's
+    behavior. Trainer-level like entropy_scale (not part of the saved
+    ThumperConfig), so it applies on resume; the schedule is a pure
+    function of env_steps and config -- nothing new is checkpointed.
+    Test-time adaptation lever (tickets/0012); main training keeps the
+    constant default."""
     critic_target_every: int = 100
     """Grad steps between hard target-critic syncs."""
     return_norm_decay: float = 0.99
@@ -458,11 +480,14 @@ class Trainer:
         available_actions = batch["available_actions"].reshape(N, -1)
 
         dream = thumper.dream(deter, stoch, macro_context, available_actions, horizon=c.dream_horizon)
+        intrinsic_scale_effective = intrinsic_scale_at(
+            c.intrinsic_scale, c.intrinsic_scale_final, self.env_steps, c.total_env_steps
+        )
         ac_cfg = ActorCriticConfig(
             gamma=c.gamma,
             return_lambda=c.return_lambda,
             entropy_scale=c.entropy_scale,
-            intrinsic_scale=c.intrinsic_scale,
+            intrinsic_scale=intrinsic_scale_effective,
         )
         losses = actor_critic_losses(
             dream,
@@ -490,6 +515,7 @@ class Trainer:
         metrics = {k: v.item() for k, v in losses.items()}
         metrics["grad_norm_actor"] = actor_grad_norm.item()
         metrics["grad_norm_critic"] = critic_grad_norm.item()
+        metrics["intrinsic_scale_effective"] = intrinsic_scale_effective
         return metrics
 
     def _log_policy_scalars(self, metrics: dict[str, float]) -> None:
@@ -511,6 +537,7 @@ class Trainer:
         w.add_scalar("policy/return_norm_scale_int", self.return_normalizer_int.scale, step)
         w.add_scalar("policy/grad_norm_actor", metrics["grad_norm_actor"], step)
         w.add_scalar("policy/grad_norm_critic", metrics["grad_norm_critic"], step)
+        w.add_scalar("policy/intrinsic_scale", metrics["intrinsic_scale_effective"], step)
 
     def _log_train_scalars(
         self, metrics: dict[str, float], outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]

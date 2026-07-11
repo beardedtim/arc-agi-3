@@ -93,3 +93,20 @@ pre-registered expectations and findings.
     incentive is gone and scoring recurs in real play.
 
 - [ ] Train during execution: _**Not started**_ — still the future goal.
+
+- [x] Planner (decision-time, over the world model): _**First mechanism landed**_
+    (ticket 0011)
+  - Policy-guided shooting (sampling-based MPC, `training/planner.py`): from the
+    actor's current latent state, roll several candidate futures (policy-sampled
+    dreams plus one greedy dream) through the world model, score each with the
+    same TD(λ) return math training already uses, and execute the best rollout's
+    first action — replanning from scratch every step. Nothing new is learned;
+    it's `Thumper.dream` + `training/actor_critic.py::lambda_returns` re-aimed at
+    picking the best of N futures instead of a policy gradient.
+  - Exposed as a third eval mode (`"plan"`, alongside `greedy`/`sampled`) so its
+    value is measured on the exact fixed protocol (ticket 0007) every other
+    mechanism is measured on — `uv run python eval.py --protocol.modes greedy plan`.
+    Eval-only for now: the collector keeps acting reactively during training.
+  - Still open: does search actually beat the reactive policy anywhere (no
+    training run pre-registered by this ticket has been executed yet), planning
+    during collection, iterative refinement (CEM) or tree search (MCTS).

@@ -110,6 +110,7 @@ class Thumper(nn.Module):
         macro_context: Tensor,
         available_actions: Tensor,
         horizon: int,
+        greedy: bool = False,
     ) -> dict[str, Tensor]:
         """Imagination rollout: from real (detached) posterior start states,
         act with the current policy and step the world model's prior for
@@ -123,6 +124,11 @@ class Thumper(nn.Module):
             seen legal actions, so disagreement on illegal ones is
             untrained garbage).
         horizon: imagined steps H.
+        greedy: argmax the policy's action choice instead of sampling it, for
+            decision-time planning's always-present policy-faithful candidate
+            (tickets/0011) -- the dynamics stay stochastic (`imagine_step`
+            still samples `stoch`), only the action choice is argmaxed.
+            Default False preserves every existing call site bit-for-bit.
 
         Returns:
           features: (N, H+1, feature_dim) -- start state's features first,
@@ -145,7 +151,7 @@ class Thumper(nn.Module):
 
         for _ in range(horizon):
             features = features_list[-1]
-            action = self.policy.act(features, available_actions)
+            action = self.policy.act(features, available_actions, greedy=greedy)
             action_type, coords = action["action_type"], action["coords"]
             action_onehot = wm.encode_actions(action_type, coords)
 

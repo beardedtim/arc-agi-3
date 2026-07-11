@@ -314,6 +314,11 @@ with. Online, that arrival state for transition t→t+1 only exists once the nex
 `observe_step`, before the policy reads features. Per-step ordering is then exactly
 training's: **step → fold → act**.
 
+An optional `planner: PlannerConfig` (`training/planner.py`, tickets/0011, §4.7) swaps
+the reactive "sample the policy once" line for decision-time planning; everything
+through the TaskEncoder fold is untouched either way, so a planning actor's real
+latent state stays identical to a reactive one's.
+
 ### 4.4 The collection side (`training/trainer.py`, `Trainer.train`)
 
 Round-robin over games (all downloaded games by default; `--config.train-games`
@@ -396,7 +401,11 @@ Then `compute_losses`, one Adam step over `world_model.parameters()`:
      `advantage = norm_ext(R_ext − V_ext) + intrinsic_scale · norm_int(R_int − V_int)`;
    - critic: MSE of both heads against their (detached) λ-returns.
    Separate Adam optimizers for policy and critic; target critic hard-synced every
-   100 grad steps.
+   100 grad steps. `intrinsic_scale` is constant during main training but can
+   optionally anneal linearly toward `intrinsic_scale_final` over a run's env-step
+   budget (`intrinsic_scale_at`, tickets/0012) — a test-time-adaptation lever
+   (`adapt.py`) for shifting a single-game run from exploration to exploitation
+   without touching either critic's unweighted loss.
 
 ### 4.7 Evaluation (`training/evaluate.py`, `eval.py`, tickets/0007)
 
@@ -431,6 +440,20 @@ everything) — adapting on a trained game would silently measure continued trai
 test-time adaptation. Each game's report has four eval cells (frozen/adapted ×
 carry off/on) plus `env_steps_to_first_score`, the closest analog of the competition's
 actual budget metric.
+
+**Decision-time planning** (tickets/0011) adds a third mode, `"plan"`, alongside
+`"greedy"`/`"sampled"` (`EvalProtocol.modes`, defaults unchanged). `training/planner.py`'s
+`plan` composes machinery this file already describes rather than adding a model
+component: from the actor's current posterior state (the `(deter, stoch, m)`
+`OnlineActor.act` holds right after its TaskEncoder fold), it rolls one greedy dream
+plus `num_candidates` sampled dreams (`Thumper.dream`, §3.5/§4.6, now with a `greedy`
+flag routed through to `Policy.act`), scores every candidate with `score_rollouts` —
+the exact same TD(λ) math §4.6 describes (`gamma * continue_prob` discounts, the
+tickets/0006 absorbing multiplier, the target-critic bootstrap) — and executes the
+first action of the best-scoring rollout. The greedy rollout is always candidate 0, so
+ties resolve toward it and `num_candidates=0` degrades the planner to exactly the
+greedy policy — the designed floor. Planning replans from scratch every step (no plan
+caching) and is eval-only: the collector stays reactive, so `Trainer` is unchanged.
 
 ### 4.8 Telemetry
 
@@ -488,12 +511,15 @@ ordered by how load-bearing they are.
    20k steps of test-time training beats zero-shot at all; a null result there points
    directly at #2 as the next necessary mechanism. (Flagged in the July 2026 tech-lead
    review as the top un-ticketed follow-up.)
-2. **No decision-time planning.** The world model is only ever used for training-time
-   imagination; at act time the policy is a single reactive forward pass. The entire
-   point of having a dynamics model at test time — rolling candidate action sequences
-   forward and picking the best (MPC/MCTS-style search) — is unused. On a novel game
-   where the policy's habits don't transfer, search over the (adapted) world model is
-   the most plausible source of competent behavior.
+2. **~~No decision-time planning~~ (tickets/0011, partial).** Policy-guided shooting
+   (sampling-based MPC, `training/planner.py`) now exists as a third eval mode
+   (`"plan"`, §4.7): from the actor's current latent state, roll N candidate futures
+   forward with the policy against the RSSM prior, score each with the same TD(λ)
+   return math training uses, and execute the first action of the best rollout,
+   replanning from scratch next step. What's still missing: no planning during
+   collection (Non-goal, distribution shift + wall-time), no iterative refinement
+   (CEM) or tree search (MCTS) — single-shot shooting first, escalate only if it shows
+   signal worth amplifying.
 3. **Online/competition operation mode.** Everything runs against `OperationMode.OFFLINE`
    and local game files. A real submission speaks the live API: scorecard lifecycle,
    the per-game action budget, rate limits, and the arc-agi agents protocol. No

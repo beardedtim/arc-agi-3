@@ -152,9 +152,9 @@ Open questions this run should inform (not gate on):
 Two observations worth carrying forward (neither a blocker):
 
 1. **`kl_raw` (~0.07) sits well _below_ the 1.0 free-nats floor**, so the KL
-   term is fully clamped and inert. *[Correction, July 10 — see Run 6
+   term is fully clamped and inert. _[Correction, July 10 — see Run 6
    Findings: the floor is per-dim, 1/32 ≈ 0.031, so 0.07 is above it and
-   the KL term was active.]* This is the benign case — recon kept
+   the KL term was active.]_ This is the benign case — recon kept
    improving, so posterior ≈ prior because the prior itself got good — but it
    means `kl_weight` currently does nothing. Revisit when tickets/0002's
    macro-context conditioning changes the prior/posterior heads; there is
@@ -177,7 +177,7 @@ conditioning the RSSM prior/posterior, heads, and ensemble), at Run 1's
 defaults in a fresh output dir. Purpose: the real regression check against
 Run 1 — recon trajectory, final samples, and imagination quality. Because
 both runs use `seed=0` against a deterministic offline env and collector,
-they gather and sample *identical* data, so samples and scalars are
+they gather and sample _identical_ data, so samples and scalars are
 comparable frame-for-frame at matched grad steps.
 
 ```sh
@@ -210,13 +210,13 @@ answered. Yes, in the one place the scalars can't see.**
   behind, converging). Recon samples at matched steps are near-identical to
   Run 1's, including the same late-to-learn small sprites.
 - **Every trained loss looked healthy — deceptively.** Smoothed `kl_raw` ran
-  *equal or lower* than Run 1's (~0.09–0.14 vs ~0.10–0.18); ensemble loss
+  _equal or lower_ than Run 1's (~0.09–0.14 vs ~0.10–0.18); ensemble loss
   noisier but falling. Only `train/grad_norm` differed in shape, running ~2×
   Run 1's throughout (3–5 vs 1.5–3).
 - **Imagination collapsed.** At matched grad steps on identical batches,
   Run 1's dreams stay on-game with minor artifacts; this run's dreams
   (9k/11k/14k/17k samples) disintegrate within 2–6 imagined frames, often
-  morphing into *other games'* textures.
+  morphing into _other games'_ textures.
 - **Root-cause A/B (script preserved in tickets/0004):** from the same
   burned-in posterior start state and real action sequence, dreams with the
   burned-in macro-context vs a zeroed one degrade about equally (burned-in
@@ -224,11 +224,11 @@ answered. Yes, in the one place the scalars can't see.**
   freeze-at-zero query; the prior itself is weaker no matter what context
   it's given.
 - **Mechanism:** during training, the prior at step t is conditioned on
-  `m_t`, freshly built every step from the *real* transitions up to t−1
+  `m_t`, freshly built every step from the _real_ transitions up to t−1
   (including detached posterior samples, which carry observation
   information). `m` is therefore a second, teacher-forced memory stream
   that always carries fresh ground-truth trajectory info at training time —
-  the prior learns to lean on it (which is *why* `kl_raw` beat Run 1's) —
+  the prior learns to lean on it (which is _why_ `kl_raw` beat Run 1's) —
   and at dream time the frozen context goes stale after one step, taking
   the prior's apparent competence with it. And because tickets/0002
   re-initializes `m` to zero each 16-step window, `m` currently carries no
@@ -253,13 +253,13 @@ First full run of the tickets/0004 architecture: `forward_sequence` grows a
 window's macro-context, then holds it frozen for the entire `seq_len`-step
 loss window — the TaskEncoder is never stepped inside the window itself.
 This is meant to remove Run 2's pathology at the root: training's
-prior/posterior conditioning is now the same *kind* of frozen, real-data
+prior/posterior conditioning is now the same _kind_ of frozen, real-data
 context that `Thumper.dream` and `imagine_with_burn_in` use, so the prior
 can no longer lean on a per-step teacher-forced context that goes stale the
 instant a dream starts. Same defaults as Runs 1/2 otherwise (100k env
-steps, `train_every=2`, `prefill_steps=1_000`, batch 16, seq_len 16, lr
+steps, `train_every=2`, `prefill_steps=1_000`, batch 16, seq*len 16, lr
 3e-4), fresh output dir, `seed=0` against the deterministic offline env —
-so this run gathers and samples data *identical* to Runs 1/2, keeping all
+so this run gathers and samples data \_identical* to Runs 1/2, keeping all
 three frame-for-frame comparable at matched grad steps. `burn_in=16` is
 passed explicitly below even though it's the default, for self-documentation.
 
@@ -318,7 +318,7 @@ EOF
 ## What to Look for
 
 Two separate checks, run in this order: the A/B script above (a diagnostic
-replay against Run 2's *unfixed* checkpoint — it does not exercise this run's
+replay against Run 2's _unfixed_ checkpoint — it does not exercise this run's
 code path, only confirms the pre-0004 mechanism), then the full rerun's
 scalars/samples against both Run 1 (the bar to meet) and Run 2 (the failure
 to beat), per tickets/0004's acceptance criteria 3–4.
@@ -329,7 +329,7 @@ to beat), per tickets/0004's acceptance criteria 3–4.
   dream) confirm Run 2's finding again: burned-in and zeroed context degrade
   about equally on Run 2's checkpoint. This isn't a pass/fail gate on its
   own — it's a repeat of the diagnosis, confirming nothing has silently
-  changed about *why* Run 2 failed before judging whether the fix (a
+  changed about _why_ Run 2 failed before judging whether the fix (a
   different training run entirely) addresses it.
 
 **Full rerun — Good (criterion 4):**
@@ -406,7 +406,7 @@ doubling each window's forward pass plus the actor-critic update). The
 as diagnosed.
 
 **One comparability caveat the pre-registration got wrong:** this run
-exercised the *full* tickets/0003 loop — the actor-critic trained from grad
+exercised the _full_ tickets/0003 loop — the actor-critic trained from grad
 step 1 and the policy (not the random collector) gathered data after the 1k
 prefill. Runs 1/2 predate 0003 and were world-model-only under random play,
 so despite `seed=0` the collected data diverges after prefill and nothing is
@@ -436,16 +436,16 @@ fix.)
   is less uniform than random play's, and each window now trains on only
   half its steps. One single-batch transient at grad step 10,067 (recon 3.1,
   grad_norm 59) recovered immediately; no NaN/inf anywhere.
-- **`kl_raw` did *not* rise back toward Run 1's level** — the opposite:
-  ~0.05 flat vs Run 1's ~0.13→0.07 (Run 3 ends at 0.034). *[Correction,
+- **`kl_raw` did _not_ rise back toward Run 1's level** — the opposite:
+  ~0.05 flat vs Run 1's ~0.13→0.07 (Run 3 ends at 0.034). _[Correction,
   July 10 — see Run 6 Findings: the floor is per-dim ≈ 0.031, so these
-  values hover at/above it and the KL term was active, not inert.]* The
+  values hover at/above it and the KL term was active, not inert.]_ The
   expected-recovery prediction was wrong, but the dreams prove the low KL is
   now honest prior competence rather than the Run 2 crutch. No retuning, per
   the ticket's non-goals.
 - **Ensemble non-degenerate but lower:** `disagreement_mean` 0.0023 at the
   end vs Run 1's 0.0074 (same order of magnitude, as pre-registered).
-  Plausibly the new consumption loop at work: the policy is now *paid* in
+  Plausibly the new consumption loop at work: the policy is now _paid_ in
   disagreement (`intrinsic_scale=1.0`), collects where the ensemble is
   uncertain, and trains the uncertainty away. Watch it doesn't collapse to
   zero on longer runs.
@@ -564,7 +564,7 @@ pre-register for the full run, not a blocker.
 - **Scales split and diverging:** `return_norm_scale_ext` settled ~0.183
   (flat) while `_int` climbed 0.33 → 0.775 over the back half — finite,
   independent, and visibly diverging. Neither approached Run 3's ~10; the
-  pre-registration missed that `--init-from` warm-starts a *converged*
+  pre-registration missed that `--init-from` warm-starts a _converged_
   world model, so disagreement starts at Run 3's final ~0.005, not a fresh
   model's large early values. Note the logged value is the raw spread EMA;
   the `max(1, scale)` floor is applied at normalize time, so with both
@@ -599,12 +599,12 @@ pre-register for the full run, not a blocker.
 - **Watch-item — entropy runs lower than Run 3's band:** median fell 3.7 →
   ~0.9–1.0 nats over 1,000 grad steps (min 0.41), vs Run 3's 2.6–3.9. The
   mechanism is the fix itself working: pre-split, the shared normalizer's
-  ~10 scale shrank *all* advantages ~10×, making `entropy_scale=1e-3`
+  ~10 scale shrank _all_ advantages ~10×, making `entropy_scale=1e-3`
   relatively strong; post-split both scales sit at the 1.0 floor, so
   advantages pass through full-size and the entropy bonus is ~10× weaker
   relative to them. Behaviorally nothing is degenerate — online action
   fractions stay spread across all 7 types (7.5–21%), and
-  `intrinsic_reward_mean` *tripled* (0.0055 → 0.016): the policy is
+  `intrinsic_reward_mean` _tripled_ (0.0055 → 0.016): the policy is
   actively steering into ensemble disagreement, which is precisely what
   the un-drowned intrinsic stream was built to buy. Entropy also flattened
   ~0.8–1.1 over the last 300 steps rather than continuing toward 0.
@@ -694,8 +694,8 @@ granularity).
   subject to available events); (3) `policy/return_norm_scale_ext` lifts
   off its ~0.18 resting value and `policy/imagined_return_ext` /
   `policy/value_ext_mean` move together off their bootstrap-dominated
-  ~0.12; (4) scoring recurs *more often than Run 3's ~4-in-200-episodes
-  incidental rate* — repeated returns on the same game, ideally any
+  ~0.12; (4) scoring recurs _more often than Run 3's ~4-in-200-episodes
+  incidental rate_ — repeated returns on the same game, ideally any
   `online/win_rate/*` > 0. Steps 1–3 are wiring doing its job; step 4 is
   the actual behavioral claim of tickets/0005. Partial credit is
   informative: 1–3 without 4 is a credit-assignment finding, not a wiring
@@ -703,7 +703,7 @@ granularity).
 - **Entropy stabilizes rather than collapsing** (Run 4's watch-item):
   `policy/entropy` holding a floor around ~0.5–1.5 nats with all
   `online/action_type_frac/*` staying under ~0.6. Lower than Run 3's
-  2.6–3.9 is *expected* (advantages are no longer shrunk ~10× by the old
+  2.6–3.9 is _expected_ (advantages are no longer shrunk ~10× by the old
   shared scale, so `entropy_scale=1e-3` is relatively weaker by design).
 - **Recon keeps converging:** `loss/recon` ending at or below Run 3's final
   0.0100 (warm start + full budget should beat it; Run 1's 0.0060 is the
@@ -715,8 +715,8 @@ granularity).
   measurably above zero with `p90` structure across games.
   `return_norm_scale_int` tracking the intrinsic return spread downward is
   the normalizer doing its job; note the `max(1, scale)` floor means
-  sub-1.0 intrinsic advantages pass through unscaled and *naturally
-  shrink* as disagreement depletes, gracefully handing dominance to the
+  sub-1.0 intrinsic advantages pass through unscaled and _naturally
+  shrink_ as disagreement depletes, gracefully handing dominance to the
   extrinsic stream. That handoff visibly starting (int stream's share of
   the advantage falling while ext's rises) would be the best possible
   version of this run.
@@ -729,12 +729,12 @@ granularity).
 - **Entropy trigger fires:** `policy/entropy` median below ~0.3 sustained
   for a few hundred grad steps, or any single `online/action_type_frac/*`
   above ~0.6. Remedy: kill, resume with `--config.entropy-scale 3e-3`
-  (`entropy_scale` is a *trainer*-level flag, not part of the checkpoint's
+  (`entropy_scale` is a _trainer_-level flag, not part of the checkpoint's
   saved `ThumperConfig`, so it takes effect on resume — verified in
   trainer.py). Log the change and the grad step it happened at here. Do
   not touch the normalizers; their floor behavior is the design.
 - **No scoring events all run:** the split can't be judged either way —
-  an *exploration* shortfall, not a tickets/0005 defect. Don't retune this
+  an _exploration_ shortfall, not a tickets/0005 defect. Don't retune this
   run's knobs in response; ticket the exploration side (Run 1's episode-cap
   observation and tickets/0002's original motivation) and consider whether
   intrinsic-only play should find reward more often than random did.
@@ -761,8 +761,8 @@ granularity).
   unclipped regression head jumps. (The two-stream design isolates any
   such damage from the int stream — verify the int stream indeed stays
   clean, which localizes the bug.)
-- **Joint intrinsic/entropy death:** `wm/disagreement_mean` at ~0 *and*
-  entropy pinned near 0 *and* no extrinsic signal yet — the policy fully
+- **Joint intrinsic/entropy death:** `wm/disagreement_mean` at ~0 _and_
+  entropy pinned near 0 _and_ no extrinsic signal yet — the policy fully
   exploited a depleted intrinsic signal and has no exploration pressure
   left. This is the self-consumption failure mode Run 3 flagged; it needs
   a design response (disagreement annealing, entropy floor, or count-based
@@ -819,7 +819,7 @@ the actor farms the reward head in imagination:**
 
 - 15-step dreams from reward-window starts collect mean **1.63** predicted
   extrinsic reward per dream (p90 3.2, max 4.3) vs the +1 a real level
-  completion pays *once*; 11% of dream steps claim r > 0.5. Uniform-random
+  completion pays _once_; 11% of dream steps claim r > 0.5. Uniform-random
   dream actions from the same starts get 0.007 — the policy specifically
   learned re-triggering sequences. `loss/reward` on real data is fine
   (~1.5e-5); the head over-predicts only on imagined, policy-steered
@@ -942,9 +942,9 @@ after resume.
 **Bad:**
 
 - `dream_score_sum` falls under 1 but scoring frequency in real play does
-  *not* recover from Run 5's incidental rate (2/104 episodes) — would mean
+  _not_ recover from Run 5's incidental rate (2/104 episodes) — would mean
   absorption fixed the imagination pathology but the actor still isn't
-  learning a *useful* scoring policy from the bounded signal (a credit-
+  learning a _useful_ scoring policy from the bounded signal (a credit-
   assignment or exploration problem, not this ticket's problem to solve).
 - `value_ext_mean` deflates but overshoots negative or oscillates instead
   of settling — would suggest the critic's regression targets are still
@@ -957,7 +957,7 @@ after resume.
   absorbing factor isn't reaching the extrinsic lambda-return as wired
   (implementation bug, re-check `actor_critic_losses` against tickets/0006
   before re-running).
-- New instability appears in the *intrinsic* stream (`value_int_mean`,
+- New instability appears in the _intrinsic_ stream (`value_int_mean`,
   `return_norm_scale_int` moving off their Run 5 baselines) — would mean
   the fix leaked into the intrinsic discount chain despite the isolation
   tests (tickets/0006's Step 4 test 5) passing in unit tests but not
@@ -967,9 +967,10 @@ after resume.
 measured raw dream reward sums, which absorption never touches by design —
 the fix operates on the λ-return's discount chain, downstream of the reward
 head's raw predictions. A checkpoint can still show per-dream reward sums
+
 > 1 post-fix; that alone proves nothing about tickets/0006. The quantity
-the acceptance criterion actually names is the extrinsic λ-return, `R_ext`,
-computed with the absorbing discount:
+> the acceptance criterion actually names is the extrinsic λ-return, `R_ext`,
+> computed with the absorbing discount:
 
 ```sh
 PYTHONPATH=. uv run python - <<'EOF'
@@ -1019,13 +1020,13 @@ EOF
 
 Reading this probe's output: `R_ext, absorbing (0006)` is the number to
 check against criterion 3 (bounded ≈ ≤ 1 from reward-window starts). If the
-checkpoint being probed was trained *before* the fix landed in
+checkpoint being probed was trained _before_ the fix landed in
 `actor_critic_losses` (i.e. its critic/policy were shaped by the unbounded
 objective), `R_ext, absorbing` will still be computed correctly here since
 this script applies the absorbing discount itself regardless of what the
 checkpoint's training loop used — but `value_ext_mean`/`return_norm_scale_ext`
 baked into that checkpoint's critic will still reflect the old, inflated
-training. Only a checkpoint whose *training* used the fix (i.e. produced by
+training. Only a checkpoint whose _training_ used the fix (i.e. produced by
 rerunning `train.py` after this ticket landed) validates the fix end to
 end; probing an old checkpoint with the new formula validates the formula,
 not the training outcome.
@@ -1034,11 +1035,12 @@ Sanity-run against Run 5's checkpoint (pre-fix training, formula applied
 post-hoc) confirms exactly that split: at reward-window starts, `R_ext`
 drops from a pre-fix-discount 6.61 mean (max 9.35) to an absorbing 2.19
 mean (max 4.41) — the discount change visibly caps the tail, but it's still
+
 > 1, because `target_values` here come from `critic_target` shaped by
-~23k grad steps of the *unbounded* objective (v_ext ≈ 6.6 baked in). This
-is the expected shape of evidence from an old checkpoint: the formula bites
-immediately, but criterion 3's ≤ 1 bound is a property of a critic *trained*
-under the fix, which only the Run 6 resume produces.
+> ~23k grad steps of the _unbounded_ objective (v*ext ≈ 6.6 baked in). This
+> is the expected shape of evidence from an old checkpoint: the formula bites
+> immediately, but criterion 3's ≤ 1 bound is a property of a critic \_trained*
+> under the fix, which only the Run 6 resume produces.
 
 ## Findings
 
@@ -1064,11 +1066,11 @@ discount deflated the poisoned extrinsic stream and held it bounded for
   after the resume transient: range ~0.01–0.67 across the span, tail mean
   0.23, final 0.12 — vs Run 5's checkpoint measuring 1.63 mean / 4.3 max
   per dream.
-- **Criterion 3 (the R_ext probe) passes on a critic *trained* under the
+- **Criterion 3 (the R*ext probe) passes on a critic \_trained* under the
   fix** — the half the Run 5 sanity-run explicitly couldn't show. From
   reward-window starts: absorbing `R_ext` t0 mean 0.737 / max **1.003**
   (uniform starts: 0.384 / 0.990). The same dreams under the pre-fix
-  discount give 1.10 mean / 6.27 max, and raw per-dream reward *sums*
+  discount give 1.10 mean / 6.27 max, and raw per-dream reward _sums_
   still reach 7.3 — the reward head can still imagine re-triggering
   sequences, but the λ-return now pays for at most one of them. That is
   exactly the designed bound: the incentive is deleted downstream of the
@@ -1085,7 +1087,7 @@ discount deflated the poisoned extrinsic stream and held it bounded for
   checkpoint scores 1.00 on sp80 at eval in both modes, so this is
   small-sample collection noise, not a lost skill). Zero wins anywhere,
   still. So pre-registered Bad #1 half-fired: absorption fixed the
-  imagination pathology and scoring now recurs *above* the incidental
+  imagination pathology and scoring now recurs _above_ the incidental
   rate on 2 of 3 games, but nothing yet looks like a policy that seeks
   levels. The standing credit-assignment/exploration gap is now cleanly
   the top open problem — with the generalization question (tickets/0009)
@@ -1102,7 +1104,7 @@ discount deflated the poisoned extrinsic stream and held it bounded for
   the sampled-mode eval churn below, and any future extrinsic-dominated
   phase should pull this back down.
 - `return_norm_scale_int` drifted 8.3 → ~13 (peak 15.2) while
-  `value_int_mean` and `disagreement_mean` stayed flat — the *spread* of
+  `value_int_mean` and `disagreement_mean` stayed flat — the _spread_ of
   intrinsic returns is widening, not the mean. The normalizer divides it
   out of the advantage, so no action now; carry into the next run as a
   watch item.
@@ -1126,7 +1128,7 @@ under (folding `(s_t, a_{t+1}, r_{t+1})` online vs `(s_t, a_t, r_t)` in
 training) — every act-time macro-context, at every step of every episode
 ever collected or evaluated, was built off-distribution from what the
 TaskEncoder was trained to interpret. This run's final checkpoint is the
-first one whose *training data collection* also ran through the misaligned
+first one whose _training data collection_ also ran through the misaligned
 loop (all of Runs 3–6), so it's the natural checkpoint to measure the
 fix's isolated effect on: same weights, same eval protocol (25 games x 5
 episodes x greedy+sampled, `--config.timeout_env_steps`-capped), same seed
@@ -1137,7 +1139,7 @@ alignment.
 the ticket): the post-fix table should be no worse than the pre-fix table,
 and any improvement is a direct measure of how much the misaligned
 macro-context was costing the policy at act time. This is a zero-shot
-correctness check on the *acting* loop only — the world model/policy
+correctness check on the _acting_ loop only — the world model/policy
 weights are unchanged between the two runs; nothing here retrains anything.
 
 **Pre-fix** (`training/online_actor.py` reverted to the commit before
@@ -1229,7 +1231,7 @@ Three run-defining constraints, all from tickets/0009:
 - **From scratch** — no `--config.init-from`: every existing checkpoint's
   world model trained on all 25 games, so warm-starting bakes held-out
   dynamics into the weights undetectably. This also makes Run 7 the first
-  run whose *entire* collection goes through the tickets/0008-aligned
+  run whose _entire_ collection goes through the tickets/0008-aligned
   acting loop (Runs 3–6 collected through the misaligned fold), so its
   `online/*` curves double as the clean post-fix baseline — at the price
   that they are not strictly comparable to Runs 3–6's (per 0008 Step 5).
@@ -1268,7 +1270,7 @@ Budget: 100k env steps at Run 3+ throughput (~5.5 env steps/s) ≈ 5h.
 tickets/0009's three numbers: (1) train-set score — did losing 5 games
 cost learning?; (2) held-out cd82/r11l — zero-shot transfer where scoring
 is known reachable, **the headline**; (3) held-out ft09/sk48/wa30 — the
-harder unknowns. The honest baseline for (2)/(3) is what *random play*
+harder unknowns. The honest baseline for (2)/(3) is what _random play_
 achieves on those games (Run 1's collection data): "beats random
 zero-shot" is the first defensible claim of generalization, pre-registered
 here before any number exists.
@@ -1351,7 +1353,7 @@ axis.** Two findings, in tension:
   almost hide: `eval/sampled/games_scored` reads **1** at 85k and 95k
   while every per-game score reads 0 — `games_scored` counts a finite
   `steps_to_first_score` (any transient nonzero-reward event) while
-  `score/<game>` logs *final* `levels_completed`, so one held-out game
+  `score/<game>` logs _final_ `levels_completed`, so one held-out game
   had a scoring event under sampled play late in training and then lost
   the level again before the episode ended. TB doesn't record which game.
   At 1 episode/game this is at noise level; the full sweep must settle it.
@@ -1362,7 +1364,7 @@ axis.** Two findings, in tension:
   episodes; nothing else scored either, and `online/win_rate/*` stayed 0.
   So Runs 4–6's scoring competence was leaning on the warm-start lineage
   (Run 3's world model + accumulated on-objective buffer) harder than
-  believed. Until a from-scratch run scores on *training* games at
+  believed. Until a from-scratch run scores on _training_ games at
   Run 6's rate, "held-out all-zero" is evidence about exploration/sample
   budget, not yet about macro-context memorization vs. inference.
 
@@ -1393,7 +1395,7 @@ remaining ~30k grad steps — the whole late-run ext stream (scale_ext
   self-recovered to ~2.0–2.3, ending ~2.7. The <0.3-sustained trigger
   never fired; no action-type frac above 0.25. Run 6's "hot" 3.7–4.3
   tail looks like a resume artifact; ~2 nats is the steady state.
-- `return_norm_scale_int`: rose 1.3 → ~9.1 by 15k, then *decayed* to
+- `return_norm_scale_int`: rose 1.3 → ~9.1 by 15k, then _decayed_ to
   ~5 — Run 6's upward drift is not a from-scratch property and not
   runaway. Keep as a passive watch item.
 - New: `online/macro_context_norm` runs much hotter from scratch —
@@ -1434,7 +1436,7 @@ sp80         sampled        0.00         0     0.00    600.0         16.2
 Three refinements to the interim reading above:
 
 - **The one nonzero final score in the whole table is on a held-out
-  game.** cd82 (never trained on) completes a level and *keeps* it in
+  game.** cd82 (never trained on) completes a level and _keeps_ it in
   2 of 5 sampled episodes (first scores at steps 20 and 139). r11l
   (also held-out) has transient scoring events in 2 of 5 sampled
   episodes (~steps 222/236) but ends both at 0. This resolves the
@@ -1449,7 +1451,7 @@ Three refinements to the interim reading above:
   scalars suggested — pre-registered Bad #2 fired.** Zero final score
   on all 20 train games in both modes (Run 6's checkpoint: 4 games
   scored greedy, lp85/sp80 at mean 1.00). sp80 scores a level within
-  ~18 steps in *all 10* of its episodes, both modes, then loses it and
+  ~18 steps in _all 10_ of its episodes, both modes, then loses it and
   rides the 600-step cap every time (it also no longer terminates
   naturally — Runs 1–6's only natural terminator). lp85: nothing, 10/10.
 - Net: the from-scratch/warm-start confound now dominates the
@@ -1518,7 +1520,7 @@ off/on); TB per game under `runs/adapt_v1/<game>/tb`.
   rather than flat. Any of these on ft09/sk48/wa30 (no known scoring
   path) would be a stronger, unexpected win.
 - **Q2 answered either way:** carry-on cells measurably differ from
-  carry-off (helping *or* hurting is informative; Arm A is a measured
+  carry-off (helping _or_ hurting is informative; Arm A is a measured
   ablation, pre-registered as such). No crashes/NaN from `m` running
   out-of-distribution across episode resets — note Run 7's finding that
   early-training `m` norms run hot.
@@ -1534,7 +1536,7 @@ off/on); TB per game under `runs/adapt_v1/<game>/tb`.
   small a budget or single-game data too thin for the current objective;
   the next lever is budget or an adaptation-specific objective
   (intrinsic_scale annealing), decided in a follow-up ticket, not here.
-- Adaptation *degrades* cd82's frozen sampled 0.40 — plausible failure:
+- Adaptation _degrades_ cd82's frozen sampled 0.40 — plausible failure:
   the intrinsic-dominated objective steers the policy away from the
   scoring behavior it already had. Would directly motivate down-weighting
   intrinsic reward at test time; capture the per-cell numbers as the
@@ -1557,10 +1559,543 @@ Decision this run should produce, pre-committed: if adapted > frozen on
 either known-reachable game, tickets/0010 validates and test-time
 adaptation becomes the default eval story (follow-up: budget scaling,
 intrinsic annealing). If flat everywhere, the negative result plus
-Run 7's from-scratch scoring regression together say the *training-time*
+Run 7's from-scratch scoring regression together say the _training-time_
 policy/exploration gap is the binding constraint — go back there before
 buying more adaptation machinery.
 
 ## Findings
 
-(to be filled at run end — or mid-run if a pre-registered exit fires)
+(Filled in July 11, morning after the overnight run. All five games
+completed — per-game reports written 21:25 July 10 (cd82) through 01:10
+July 11 (wa30). Condensed four-cell table below; full per-episode data in
+each `runs/adapt_v1/<game>/adapt_report.json`, per-game TB under
+`runs/adapt_v1/<game>/tb`.)
+
+**Verdict: tickets/0010 validates — the pre-committed "adapted > frozen
+on a known-reachable game" exit fires on cd82.** Adaptation turned a
+policy that never trained on cd82 from greedy 0.00 / sampled 0.20 into
+greedy 0.80 / sampled 1.00, and the in-adaptation `eval_every=5000`
+curve rose rather than spiking only at the end (sampled 0 → 0.40 → 0.20
+→ 1.00 at 5k/10k/15k/20k; greedy 0 → 0.80 at 20k). First real score at
+env step 6,763 of the 20k budget; collection episodes at ~19.4k–19.9k
+score 1.0 back-to-back. Per the pre-committed decision: test-time
+adaptation becomes the default eval story.
+
+```
+game  cell                 greedy  sampled   env_steps_to_first_score
+cd82  frozen,  carry=off     0.00     0.20   6763
+cd82  frozen,  carry=on      0.00     0.40
+cd82  adapted, carry=off     0.80     1.00
+cd82  adapted, carry=on      0.80     1.00
+r11l  all four cells         0.00     0.00   1103
+ft09  all four cells         0.00     0.00   None
+sk48  all four cells         0.00     0.00   None
+wa30  all four cells         0.00     0.00   None
+```
+
+(mean_levels_completed; win_rate 0.00 everywhere.)
+
+**Sanity anchor: passed in the only sense it could — and the
+pre-registration was flawed, not the plumbing.** The frozen cells cannot
+reproduce Run 7's *sampled* rows exactly: `evaluate` reseeds once per
+**mode** and all games in a sweep share the RNG stream, so a single-game
+eval puts that game at a different stream position than the 25-game
+sweep did (cd82 frozen sampled 0.20 here vs 0.40 there — one episode of
+five at n=5, RNG offset, not weights drift). The deterministic check —
+greedy, which doesn't consume the sampling stream — matches exactly
+(0.00 = 0.00 on every game). No `init_from_full` fault indicated; the
+Ugly anchor-failure trigger did not fire. (Follow-up if exact sampled
+reproduction ever matters: reseed per (game, mode) in `evaluate`.)
+
+**r11l: the pre-registered "adaptation degrades" Bad case fired in
+substance, and it's the most actionable finding of the run.**
+Adaptation scored once, very early (env step 1,103 — faster than cd82)
+and never again in 20k steps. Worse, the adapted policy *lost* the
+frozen policy's transient scoring events: frozen sampled had reward
+events at steps 359/501 (ending at 0, as in Run 7); adapted has zero
+events in any cell. TB shows the mechanism: `policy/entropy` collapsed
+from ~7.4 early to ~0.58 at the tail (vs cd82's healthy ~1.5),
+`value_ext_mean` inflated to ~0.76 anchored by that single event, and
+adapted greedy switched from frozen's 62-step deaths to riding the
+600-step cap — 20k steps of intrinsic-dominated training taught it
+survival and disagreement-farming, not scoring. This is the direct
+evidence for the follow-up the pre-registration named: down-weight or
+anneal `intrinsic_scale` during test-time adaptation (ticket it; the
+next adapt run should carry an `--intrinsic-scale` arm).
+
+**ft09/sk48/wa30: all-zero in every cell** — the pre-registered
+expected-ish read on the no-known-scoring-path games; sk48/wa30 ride
+the cap in every cell, before and after. One oddity worth keeping:
+ft09's *adapted* policy terminates every episode at ~32 steps (frozen
+greedy varied 36–251) — consistent with learning to reach a fast reset
+to farm the novelty around episode starts. Same intrinsic-objective
+signature as r11l, different surface behavior; more fuel for the
+annealing ticket.
+
+**Q2 (carried macro-context): essentially neutral — answered, as
+pre-registered, just not excitingly.** Frozen cd82: carry-on sampled
+0.40 vs carry-off 0.20 — one extra scoring episode at n=5, noise-level.
+Adapted cells: carry-on and carry-off are byte-identical on cd82 and
+ft09 (the adapted, low-entropy policy takes the same actions either
+way; frozen cd82's cells *do* diverge at episode 5, so the flag
+demonstrably reaches the actor). No crashes/NaN from out-of-distribution
+`m`. Arm A neither helps nor hurts measurably at this budget.
+
+**Adaptation internals healthy on all five games** — no Ugly trigger
+fired: no NaN/inf anywhere; `policy/dream_score_sum` tails bounded well
+under 1 (brief single-batch transients to ~6, immediately recovered —
+Run 7's shape); recon fell to ~0.0015 on single-game data (better than
+any multi-game run, as expected); the novelty guard passed silently on
+all five held-out games; and each game's `online/*` scalars contain
+only that game — no contamination.
+
+**Housekeeping loss discovered while writing this up:**
+`runs/held_out_v1/eval_100000.json` — Run 7's pre-registered 250-episode
+sweep artifact — was overwritten (July 10, 21:59) by a 4-episode
+plan-mode smoke test from tickets/0011's implementation check (`eval.py`
+names its output `eval_<env_steps>.json`, so every sweep against the
+same checkpoint collides). Run 7's summary tables survive in its entry
+above; the per-episode JSON is gone. The smoke test itself carries a
+signal worth keeping: **plan mode scored cd82 zero-shot in 13 steps
+under a 15-step cap** (1 of 2 episodes), where frozen greedy scores 0 —
+an encouraging pre-signal for Run 9. Rename discipline added to Run 9's
+launch notes below.
+
+Decision: tickets/0010 closes validated. Follow-ups, in order: (1)
+Run 9 (already pre-registered below) — the planning sweep, whose Q2 is
+now genuinely live given cd82's adapted checkpoint and the smoke-test
+signal; (2) a test-time intrinsic-annealing ticket with r11l/ft09's
+numbers as the evidence; (3) budget scaling only after those two.
+
+---
+
+# Run 9 — tickets/0011 decision-time planning, measurement sweep (July 10, 2026)
+
+No training in this entry — `eval.py` only, per tickets/0011 Step 7 (same
+shape as tickets/0007: measurement, not a training run). tickets/0011
+implemented policy-guided shooting (sampling-based MPC,
+`training/planner.py`): from the actor's current latent state, roll `N`
+policy-sampled dreams plus one always-present greedy dream through
+`Thumper.dream`, score each with the exact TD(λ) return math
+`training/actor_critic.py` trains on (same γ/λ, the tickets/0006 absorbing
+extrinsic discount, the target-critic bootstrap), and execute the first
+action of the best-scoring rollout — replanning from scratch every step.
+Exposed as a third `EvalProtocol` mode, `"plan"`, alongside the existing
+`greedy`/`sampled`.
+
+Run 7 (tickets/0009, from-scratch, held-out split) and Run 8 (tickets/0010,
+per-game test-time adaptation, assumed passing above) are the two existing
+checkpoints/report lineages this ticket was written to sit next to:
+tickets/0010 Step 7 pre-registered a null adaptation result as the trigger
+for this mechanism, but Run 8's Findings (this entry, assumed-Good) show
+adaptation _did_ help on cd82 — so the question this run answers is not
+"is planning the fallback" but the ticket's own pre-registered one: does
+decision-time search add anything **on top of** either the frozen
+zero-shot policy or the adapted one, independent of how Run 8 came out.
+
+```sh
+# (1) Zero-shot: greedy vs plan on the from-scratch held-out checkpoint,
+# every game (all 25) x 5 episodes, so train-set and held-out both get a
+# reading in one sweep -- planner defaults throughout (num_candidates=64,
+# horizon=15, intrinsic_scale=0.0, matching TrainerConfig.dream_horizon).
+uv run python eval.py --checkpoint runs/held_out_v1/latest.pt \
+  --protocol.modes greedy plan
+
+# (2) Does planning stack with test-time training? Per adapted per-game
+# checkpoint from Run 8 (cd82/r11l -- the two with a demonstrated scoring
+# path -- first; ft09/sk48/wa30 after if time allows), frozen+plan vs
+# adapted+plan against that same game only. adapt_report.json's four-cell
+# schema is not widened (tickets/0011 Non-goals) -- these are separate
+# eval.py invocations against the adapted latest.pt files.
+for game in cd82 r11l ft09 sk48 wa30; do
+  uv run python eval.py --checkpoint runs/adapt_v1/$game/latest.pt \
+    --protocol.modes greedy plan --protocol.games $game \
+    --protocol.episodes-per-game 5
+done
+```
+
+Wall-time note (tickets/0011 Step 7): `plan` costs
+~`(num_candidates + 1) x horizon` world-model steps per env step — at
+defaults (64 + 1) x 15 = 975x a reactive step's dream cost. Sweep (1) is
+25 games x 5 episodes x ≤600 steps x 2 modes, with only the `plan` mode
+paying that multiplier (`greedy` is the existing cheap reactive path) —
+budget accordingly and consider `--protocol.max-steps` / a smaller
+`--protocol.planner.num-candidates` if wall-clock is prohibitive before
+cutting `--protocol.games`/`--protocol.episodes-per-game` (losing games
+from the sweep loses the per-game comparison this run exists to make).
+
+## What to Look for
+
+Both pre-registered questions from tickets/0011 Step 7, read directly off
+`eval.py`'s printed summary table / `eval_report.json` — no TensorBoard
+archaeology, per the ticket's acceptance criterion 5.
+
+**Good:**
+
+- **Q1 — plan beats greedy somewhere, and _where_ is the finding.**
+  `mean_levels_completed` and/or `win_rate` higher under `plan` than
+  `greedy` on at least one game — the strongest version of this result is
+  it showing up on the **held-out** games (ft09/sk48/wa30, or cd82/r11l
+  read zero-shot from `held_out_v1` rather than the adapted checkpoints),
+  since Missing Feature #2 specifically predicted search matters most
+  where the reactive policy's habits don't transfer. A gain confined to
+  training games (lp85/sp80, where the reward head is best-anchored per
+  tickets/0011's own framing) is real but a weaker result — the reward
+  head has more real data to rank futures by there regardless of transfer.
+- **The floor holds in this sweep too:** spot-checking
+  `--protocol.planner.num-candidates 0` against plain `greedy` on a couple
+  of games reproduces identical rows (already verified once against this
+  same checkpoint at implementation time — see tickets/0011's acceptance
+  criterion 2 — but worth reconfirming here since this is the first sweep
+  run at production `num_candidates=64`, a different code path's N).
+- **Q2 — planning stacks with adaptation.** `adapted+plan` beats both
+  `adapted+greedy` (Run 8's cell) and `frozen+plan`, i.e. the two
+  mechanisms' gains are at least partially additive rather than one
+  subsuming the other — cd82 (Run 8's clearest win) is the best-powered
+  test of this.
+- `greedy_chosen` rate (log manually if debugging demands it, per the
+  ticket) sits meaningfully below 1.0 on any game `plan` improves — the
+  scorer is overriding the policy's own action at least sometimes, which
+  is the mechanistic signature behind any score gain. A gain with
+  `greedy_chosen` ≈ 1.0 would be suspicious (nothing should differ from
+  greedy if the greedy rollout is always winning the argmax).
+
+**Bad (the honest expectation, not a failure — tune or investigate before
+concluding the mechanism is broken):**
+
+- **`plan` ≈ `greedy` everywhere** — the pre-registered honest-expectation
+  outcome per tickets/0011's own text: "with a weak reward head, plan ≈
+  greedy (the designed floor)". Genuine gains require the reward/continue
+  heads to rank imagined futures better than the policy's own habits, and
+  nothing about landing the mechanism changes how well-anchored those
+  heads are today (Run 6/7's reward head was validated on real transitions,
+  not on the _policy-steered imagined_ ones a wide shooting search
+  explores — a different distribution than either training loop has
+  stress-tested). If this fires, it is itself the finding: search adds
+  nothing until the world model's predictive quality is the binding
+  constraint, and the response is improving the world model (more data,
+  more capacity, or the ensemble/uncertainty-aware scoring tickets/0011's
+  Non-goals deferred), not re-tuning `num_candidates`/`horizon` first.
+- `greedy_chosen` near 1.0 with no score gain — confirms the "weak
+  reward head, uninformative scorer" reading directly (per tickets/0011
+  Step 7): the search is happening but the scorer never disagrees with
+  the policy's own greedy choice.
+- `greedy_chosen` near 0.0 with no score gain — the opposite and more
+  concerning shape: the scorer _is_ overriding the policy but not toward
+  anything that helps real play, i.e. the reward/continue heads are
+  hallucinating plannable futures the same way Run 5 diagnosed for
+  imagination-trained returns (tickets/0006's original failure mode),
+  just surfaced at decision time instead of training time. Would motivate
+  revisiting whether `score_rollouts`'s absorbing-extrinsic bound is
+  enough protection at search time the way it was for training.
+
+**Ugly (stop and investigate — implementation bug, not a modeling
+result):**
+
+- The `num_candidates=0` floor check disagrees with plain `greedy` at
+  production settings — something about batching N=64 candidate rows
+  differs from the N=0 code path in a way tests/test_planner.py's
+  small-Thumper check didn't catch at real model scale.
+- NaN/inf in any `plan`-mode episode, or a crash inside `score_rollouts`/
+  `plan` — the real checkpoint's tensors exercise shapes/ranges the
+  shrunken test config doesn't.
+- Two runs of the same sweep command are not byte-identical
+  `eval_report.json`s (already spot-checked once at implementation time
+  for a smaller sweep — this is the production-scale reconfirmation).
+
+Decision this run should produce, pre-committed: if Q1 fires (plan beats
+greedy anywhere, ideally held-out), decision-time planning is validated
+as a usable eval-time mechanism and the natural next step is feeding it
+back during collection (explicitly out of this ticket's scope, its own
+future ticket per the Non-goals) or escalating to CEM/MCTS if the
+shooting signal is strong enough to amplify. If Bad fires cleanly
+(plan ≈ greedy everywhere), the honest reading is that the world model's
+predictive quality, not the lack of search, is the binding constraint —
+next work goes back to world-model data/capacity rather than planner
+tuning.
+
+### Pre-launch amendments (July 11 — after Run 8's Findings landed)
+
+The entry above was written while Run 8 was still assumed-passing;
+Run 8's actual Findings sharpen it in three ways, recorded here before
+launch so the pre-registration stays honest:
+
+- **Q2 is reframed by Run 8's split result.** cd82's adapted checkpoint
+  (greedy 0.80 / sampled 1.00) is the best-powered test of
+  "planning stacks with adaptation," as already noted. But r11l's
+  adapted checkpoint is now a *different* question and arguably the more
+  interesting one: its reward head trained on a real scoring event
+  (env step 1,103) while its policy was steered away from scoring by
+  the intrinsic-dominated objective (entropy ~0.58, zero eval events).
+  If planning's value comes from the reward/continue heads overriding
+  the policy's habits, r11l is the cleanest place for `plan` to beat
+  both `greedy` *and* the adapted policy's own behavior — plan > greedy
+  on adapted-r11l would directly demonstrate search recovering
+  competence the reactive policy has but won't express.
+- **Pre-signal on file:** tickets/0011's implementation-time smoke test
+  (now sitting in `runs/held_out_v1/eval_100000.json`, see below)
+  scored cd82 zero-shot in 13 steps under a 15-step cap in plan mode,
+  where frozen greedy scores 0.00. Q1 is live, not just hopeful.
+- **Artifact discipline — `eval.py` output naming collides.** It writes
+  `eval_<env_steps>.json` next to the checkpoint, which is how Run 7's
+  250-episode sweep JSON was silently clobbered by the smoke test.
+  Before sweep (1), preserve the smoke file; after every `eval.py`
+  invocation against the same checkpoint, rename the fresh output
+  before the next one:
+
+  ```sh
+  mv runs/held_out_v1/eval_100000.json \
+     runs/held_out_v1/eval_100000_plan_smoke.json   # before launch
+  # after sweep (1):
+  mv runs/held_out_v1/eval_100000.json runs/held_out_v1/eval_100000_greedy_plan.json
+  # the num-candidates=0 floor spot-check gets its own rename too.
+  ```
+
+  The adapted checkpoints write `eval_20000.json` in their own
+  `runs/adapt_v1/<game>/` dirs — no existing file, no collision.
+- **Launch order: run part (2) first.** The five per-game evals against
+  the adapted checkpoints are far cheaper than the 25-game sweep (5
+  games × 5 episodes × ≤600 steps × 2 modes, only `plan` paying the
+  ~975× dream multiplier) and contain the two most informative
+  questions (cd82 stacking, r11l rescue). Sweep (1) follows if part
+  (2)'s wall-clock confirms the budget is tolerable; shrink
+  `--protocol.planner.num-candidates` before cutting games/episodes,
+  per the wall-time note above.
+
+## Findings (July 11, 2026 — part (2) complete; sweep (1) not run, disposition below)
+
+**Verdict: the pre-registered Bad branch fired, and on cd82 it fired
+*harder* than Bad — plan is worse than greedy on the one game where the
+policy is competent.** Decision-time planning as implemented adds nothing
+on top of adaptation at current reward-head quality. The run's real
+product is a clean mechanistic account of *why*, and both halves of that
+account point at tickets/0012.
+
+Per-game (adapted `runs/adapt_v1/<game>/latest.pt` checkpoints, that
+game only, 5 episodes/mode, planner defaults; outputs preserved as
+`runs/adapt_v1/<game>/eval_20000_plan_run9.json` per the rename
+discipline):
+
+| game | greedy mean | plan mean | shape |
+|------|------------|-----------|-------|
+| cd82 | **1.00** (5/5, scores at steps 9–11) | **0.40** (2/5, scores at 4 and 103) | plan *hurts* |
+| r11l | 0.00 (all 600-cap) | 0.00 (all 600-cap) | rescue refuted |
+| ft09 | 0.00 (all exactly 32 steps) | 0.00 (32/33/100/103/104) | habit broken, no reward |
+| sk48 | 0.00 (600-cap) | 0.00 (600-cap) | unchanged |
+| wa30 | 0.00 (600-cap) | 0.00 (600-cap) | unchanged |
+
+**cd82 — the sharp negative.** Greedy scores within 9–11 steps in every
+episode; plan scores in 2 of 5. The three scoreless plan episodes all
+end at *exactly* length 100 — together with greedy's ~110-step episodes
+(≈100 steps after scoring at ~10) this reads as a ~100-step per-level
+timer, i.e. plan wandered away the entire level-1 clock. This is not a
+floor violation: the greedy rollout is always candidate 0, but the floor
+only guarantees `num_candidates=0` ≡ greedy — at N=64 plan executes the
+first action of whichever rollout the TD(λ) scorer ranks best, and once
+it deviates it replans from off-greedy states it steered itself into.
+So plan < greedy is direct evidence for pre-registered Bad shape 3: the
+reward/continue heads rank some imagined non-greedy futures above the
+*true* scoring path — hallucinated plannable futures, tickets/0006's
+training-time failure mode resurfacing at search time. The flip side is
+real too: when the scorer agreed with reality, plan scored at step 4,
+faster than greedy ever does — the search can shortcut when the head is
+right; it just isn't right reliably. (Minor note: greedy here is 1.00
+vs Run 8's adapted-greedy cell of 0.80 — one episode at n=5, and cd82's
+env is visibly stochastic across resets (frozen sampled lengths
+102/315/600/223 in Run 8), so greedy is not bit-repeatable across
+invocations. Noise, not weights drift.)
+
+**r11l — the pre-launch-amendment question ("search recovers suppressed
+competence") is refuted at this budget, with a mechanism that matters.**
+All 10 episodes, both modes, ride the 600-step cap with zero reward
+events. The amendment hoped the reward head — trained on the real
+step-1,103 event — could out-vote the collapsed policy. It structurally
+cannot in policy-guided shooting: candidates are sampled *from* the
+collapsed policy (entropy ~0.58), so the 64 sampled rollouts barely
+diverge from the greedy one and the scorer is never shown the scoring
+path in the first place. Entropy collapse doesn't just kill reactive
+play; it kills the planner's search width. This upgrades tickets/0012
+from "fix the actor's objective" to *the enabling condition for
+decision-time search on adapted checkpoints* — pre-registered as a
+Run 10 secondary question below.
+
+**ft09 — plan demonstrably overrides habits, just not toward reward.**
+Greedy repeats the 32-step fast-reset loop in all 5 episodes; plan
+breaks out of it in 3 of 5 (episodes of 100–104 steps — the ~100 shape
+again), still scoreless. Mechanistically encouraging (the scorer *does*
+override the policy, so `greedy_chosen` < 1 in practice), outcome-
+neutral. sk48/wa30: nothing in any cell, as in every prior measurement.
+
+**No Ugly trigger fired** — no NaN/inf or crash in any plan episode.
+The production-scale `num-candidates 0` floor spot-check was *not* run;
+given cd82's plan < greedy it is now the cheapest falsification of the
+"scorer misleads" reading (if the floor is broken, that result is a bug,
+not a finding) — ~5 minutes on adapted cd82, folded into Run 10
+pre-work.
+
+**Sweep (1) not run — deliberate disposition, not an omission.**
+Wall-clock from part (2): a 600-cap game costs ~30 min in plan mode
+(r11l 06:18→06:47, sk48 06:51→07:23, wa30 07:23→07:56 by file mtimes),
+so the 25-game sweep is 10h+, dominated by cap-riders. With Q2 answered
+negative, the only still-live sweep question is Q1 zero-shot — and it
+*is* still live: the frozen `held_out_v1` policy never went through 20k
+steps of intrinsic-dominated adaptation, so its entropy (and therefore
+the planner's proposal diversity) is intact, which is exactly the
+configuration where the smoke test scored cd82 in 13 steps while frozen
+greedy scores 0.00. A scoped 5-held-out-game version is Run 10's
+pre-work; the full 25-game sweep only happens if the scoped one shows a
+gain worth mapping across training games.
+
+Decision, per the pre-commit: do **not** feed planning back into
+collection, and do not tune `num_candidates`/`horizon` — the binding
+constraints are reward/continue-head quality on policy-steered imagined
+futures (cd82) and proposal diversity under entropy collapse (r11l),
+not search breadth. tickets/0011 closes as "mechanism landed, works as
+implemented, negative at current model quality"; the planner stays
+eval-only. Next: Run 10.
+
+---
+
+# Run 10 — tickets/0012 test-time intrinsic annealing (pre-registered July 11, 2026)
+
+Two parts. Pre-work needs no new code and can run **while tickets/0012
+is being implemented**; the main arm launches once 0012 lands and its
+tests are green.
+
+## Pre-work (before 0012 lands — `eval.py` only)
+
+Run 9's five outputs were already renamed to
+`runs/adapt_v1/<game>/eval_20000_plan_run9.json`, so the collision path
+is clear. Rename each fresh output before the next invocation against
+the same checkpoint, as below.
+
+```sh
+# (a) ~5 min — production-scale floor check, on the game where plan lost
+# to greedy. Expect the plan rows to be identical to the greedy rows;
+# any divergence is Run 9's Ugly trigger (tickets/0011 bug) and Run 9's
+# cd82 conclusion is void until it's resolved.
+uv run python eval.py --checkpoint runs/adapt_v1/cd82/latest.pt \
+  --protocol.modes greedy plan --protocol.games cd82 \
+  --protocol.planner.num-candidates 0
+mv runs/adapt_v1/cd82/eval_20000.json \
+   runs/adapt_v1/cd82/eval_20000_floor_check.json
+
+# (b) ~2.5h — the scoped remainder of Run 9's sweep (1): Q1 zero-shot on
+# the frozen checkpoint, held-out games only. The frozen policy's entropy
+# is intact, so policy-guided shooting has real proposal diversity here
+# (unlike adapted r11l), and the smoke pre-signal (cd82 plan scoring in
+# 13 steps where frozen greedy scores 0.00) is exactly this arm.
+uv run python eval.py --checkpoint runs/held_out_v1/latest.pt \
+  --protocol.modes greedy plan \
+  --protocol.games cd82 r11l ft09 sk48 wa30
+mv runs/held_out_v1/eval_100000.json \
+   runs/held_out_v1/eval_100000_plan_heldout.json
+```
+
+Pre-registered read for (b): **Good** = plan > greedy on any held-out
+game (cd82 the live candidate) — tickets/0011's Q1 fires where it was
+predicted to matter most, and the 25-game sweep gets scheduled to map
+the gain. **Bad** = plan ≈ greedy everywhere — Q1 closes negative at
+current reward-head quality, consistent with Run 9's cd82 diagnosis,
+and no further planner sweeps run until the world model improves.
+Either way tickets/0011's last open question is answered at ~2.5h
+instead of 10h+.
+
+## Main arm (after 0012 lands): annealed test-time adaptation
+
+Exactly tickets/0012 Step 6's pre-registered command — one new arm
+against Run 8's existing baseline (`runs/adapt_v1`, constant
+`intrinsic_scale=1.0`, **do not rerun it**), same checkpoint, seed,
+budget, and eval protocol; only the schedule differs:
+
+```sh
+uv run python adapt.py \
+  --checkpoint runs/held_out_v1/latest.pt \
+  --games r11l cd82 ft09 \
+  --output-dir runs/adapt_v2_anneal \
+  --intrinsic-scale-final 0.0
+```
+
+Launch gate: `uv run pytest` green including 0012's four new tests, and
+the ticket's acceptance criteria hold (notably: no `--intrinsic-scale-
+final` flag ⇒ bit-identical behavior to today). Wall-clock ~3h (Run 8
+measured ~57 min/game; three games).
+
+## What to Look for
+
+**Good:**
+
+- **r11l — the headline.** Any adapted cell > 0.00 (baseline: all four
+  cells 0.00 despite `env_steps_to_first_score=1103`), and adapted play
+  *retaining* sampled-mode scoring events rather than erasing frozen's
+  transients (Run 8's steps-359/501 events). Mechanistic TB checks:
+  `policy/intrinsic_scale` ramping linearly 1.0 → 0.0 over the 20k
+  budget; `policy/entropy` tail meaningfully above Run 8's ~0.58;
+  `value_ext_mean` not inflating past Run 8's ~0.76 on the same
+  single-event diet.
+- **cd82 — do-no-harm control.** Adapted cells at or near Run 8's
+  greedy 0.80 / sampled 1.00 (allow one-episode noise — see Run 9's
+  1.00-vs-0.80 note; cd82's env is stochastic across resets), and
+  `env_steps_to_first_score` not much worse than 6,763. The linear
+  schedule still has scale ≈ 0.66 at step 6,763, so early exploration
+  is barely touched — a large regression here would be surprising and
+  informative.
+- **ft09 — degeneracy gone.** Adapted greedy episode lengths no longer
+  locked at ~32 (the fast-reset novelty-farming loop). A score is not
+  expected; losing the degenerate attractor is the win condition.
+- **Run 9's mechanism hook (secondary, pre-registered):** after the arm
+  completes, rerun the plan eval on annealed r11l —
+
+  ```sh
+  uv run python eval.py --checkpoint runs/adapt_v2_anneal/r11l/latest.pt \
+    --protocol.modes greedy plan --protocol.games r11l
+  mv runs/adapt_v2_anneal/r11l/eval_20000.json \
+     runs/adapt_v2_anneal/r11l/eval_20000_plan.json
+  ```
+
+  If annealing preserves entropy, policy-guided shooting regains the
+  proposal diversity Run 9 showed it loses under collapse — plan >
+  greedy here would recover Run 9's refuted rescue and tie 0011 and
+  0012 together mechanistically. Secondary signal only, not the exit
+  criterion.
+
+**Bad (informative, not failure):**
+
+- r11l entropy stays healthy but every cell is still 0.00 — intrinsic
+  dominance was not the (only) binding constraint; the residual
+  suspects are budget (one reward event in 20k steps is a thin diet for
+  the extrinsic stream) and plain reward sparsity. The response is
+  budget scaling (Run 8's deferred follow-up: 2–3× on r11l), not
+  schedule tuning.
+- cd82 regresses meaningfully (adapted greedy well below 0.80) — late
+  intrinsic signal was still buying useful exploration on cd82 at this
+  budget. The documented response is the nonzero-floor follow-up arm
+  (`--intrinsic-scale-final 0.1`, per tickets/0012), not abandoning the
+  schedule.
+- `policy/entropy` pins at its maximum late in adaptation on the
+  zero-signal games (tickets/0012's pre-registered secondary risk: with
+  both advantage streams near zero, the entropy bonus is unopposed) —
+  same 0.1-floor follow-up arm.
+
+**Ugly (stop and investigate — implementation bug):**
+
+- `policy/intrinsic_scale` is not a clean linear 1.0 → 0.0 ramp in env
+  steps (schedule wired to the wrong counter, or applied to the critic
+  losses — tickets/0012 Non-goals say actor mix only).
+- NaN/inf anywhere, or the novelty guard behaving differently from
+  Run 8 on identical inputs (the arm changes nothing upstream of it).
+- Baseline drift: rerunning any `runs/adapt_v1` eval cell disagrees
+  with Run 8's report beyond cd82-style reset noise — would mean 0012's
+  changes weren't inert with the flag off, contradicting its acceptance
+  criterion 4.
+
+Decision this run should produce, pre-committed: if r11l retains
+scoring, tickets/0012 validates and budget scaling on r11l is next. If
+r11l stays zero *with* healthy entropy, annealing is kept as a
+default-off arm and the next lever is budget, not schedules. A split
+(cd82 harmed + r11l helped) routes to the 0.1-floor arm before any
+conclusion is drawn.
+
+## Findings
+
+(to be filled after both parts)

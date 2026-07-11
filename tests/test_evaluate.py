@@ -14,6 +14,7 @@ from model.rssm import RSSM
 from tests.conftest import GRID, STACK, small_config
 from training.evaluate import EvalProtocol, EvalReport, evaluate
 from training.online_actor import OnlineActor
+from training.planner import PlannerConfig
 from training.trainer import Trainer, TrainerConfig
 
 
@@ -394,6 +395,52 @@ class TestEvaluate:
         assert construction_count == 4  # 2 games x 2 modes
         assert len(carry_flags) == 2 * 2 * protocol.episodes_per_game
         assert all(carry_flags)
+
+
+class TestPlanMode:
+    """tickets/0011: "plan" is a third protocol mode, measured like the
+    other two -- an end-to-end evaluate() run through it, determinism, and
+    that an unknown mode string raises rather than silently measuring
+    sampled."""
+
+    def _thumper(self, tmp_path):
+        return Trainer(
+            TrainerConfig(thumper=small_config(), output_dir=str(tmp_path), resume=False, device="cpu")
+        ).thumper
+
+    def test_plan_mode_end_to_end_and_deterministic(self, tmp_path):
+        thumper = self._thumper(tmp_path)
+        env = ScriptedEnv(
+            {
+                "g1": [(0.0, False, False)] * 5 + [(1.0, True, True)],
+                "g2": [(0.0, False, False)] * 6,
+            }
+        )
+        protocol = EvalProtocol(
+            games=["g1", "g2"],
+            episodes_per_game=1,
+            max_steps=6,
+            modes=("plan",),
+            seed=0,
+            planner=PlannerConfig(num_candidates=2, horizon=2),
+        )
+
+        report1 = evaluate(thumper, env, protocol)
+        report2 = evaluate(thumper, env, protocol)
+
+        assert len(report1.episodes) > 0
+        assert all(ep.mode == "plan" for ep in report1.episodes)
+        assert report1.to_json() == report2.to_json()
+
+    def test_unknown_mode_raises(self, tmp_path):
+        thumper = self._thumper(tmp_path)
+        env = ScriptedEnv({"g1": [(0.0, False, False)] * 5})
+        protocol = EvalProtocol(games=["g1"], episodes_per_game=1, max_steps=5, modes=("palm",))
+        try:
+            evaluate(thumper, env, protocol)
+            assert False, "expected ValueError for unknown mode"
+        except ValueError:
+            pass
 
 
 class TestEvalIsolation:

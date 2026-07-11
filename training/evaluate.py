@@ -28,6 +28,9 @@ from env.env import Env
 from model.actions import ACTION6
 from model.thumper import Thumper
 from training.online_actor import OnlineActor
+from training.planner import PlannerConfig
+
+VALID_MODES = ("greedy", "sampled", "plan")
 
 
 @dataclass
@@ -44,6 +47,11 @@ class EvalProtocol:
     (tickets/0010 Arm A) -- measures whether the task belief built in
     episode 1 helps episode 2+. Off by default, which preserves 0007/0009
     semantics exactly (a fresh actor per episode)."""
+    planner: PlannerConfig = field(default_factory=PlannerConfig)
+    """Decision-time planning config (tickets/0011) -- consumed only when
+    `"plan"` is in `modes`. Request the mode with `--protocol.modes greedy
+    sampled plan` (tyro parses the tuple as space-separated values, like
+    `eval-games`)."""
 
 
 @dataclass
@@ -143,6 +151,10 @@ def evaluate(thumper: Thumper, env: Env, protocol: EvalProtocol) -> EvalReport:
     games = protocol.games if protocol.games is not None else env.games()
     device = next(thumper.parameters()).device
 
+    for mode in protocol.modes:
+        if mode not in VALID_MODES:
+            raise ValueError(f"Unknown eval mode {mode!r}; valid modes are {VALID_MODES}")
+
     was_training = thumper.training
     thumper.eval()
     report = EvalReport()
@@ -160,7 +172,9 @@ def evaluate(thumper: Thumper, env: Env, protocol: EvalProtocol) -> EvalReport:
                     # can never leak into another game or mode, since the
                     # actor itself doesn't either (tickets/0010 Design
                     # principle 3 -- structural, not conditional).
-                    actor = OnlineActor(thumper, str(device))
+                    actor = OnlineActor(
+                        thumper, str(device), planner=protocol.planner if mode == "plan" else None
+                    )
                     for _ in range(protocol.episodes_per_game):
                         report.episodes.append(
                             _run_episode(

@@ -4,12 +4,13 @@ sample renderers. Uses small_config() so the suite stays fast and CPU-only;
 no real env needed."""
 import torch
 
+import training.trainer as trainer_module
 from env.env import Env, StepResult
 from model.actions import NUM_ACTION_TYPES, RESET
 from tests.conftest import GRID, STACK, small_config
 from training.qualitative import save_imagination_check, save_recon_check
 from training.replay_buffer import ReplayBuffer
-from training.trainer import Trainer, TrainerConfig
+from training.trainer import Trainer, TrainerConfig, intrinsic_scale_at
 
 
 def _fill_episode(buffer: ReplayBuffer, length: int, fill_value_offset: int = 0, game_id: int = 0):
@@ -163,6 +164,26 @@ class TestReplayBuffer:
             assert mask.all()
 
 
+class TestIntrinsicScaleAt:
+    def test_constant_when_final_none(self):
+        for env_steps in (0, 5_000, 10_000, 100_000):
+            assert intrinsic_scale_at(1.0, None, env_steps, 10_000) == 1.0
+
+    def test_linear_endpoints_midpoint_clamp(self):
+        assert intrinsic_scale_at(1.0, 0.0, 0, 20_000) == 1.0
+        assert intrinsic_scale_at(1.0, 0.0, 10_000, 20_000) == 0.5
+        assert intrinsic_scale_at(1.0, 0.0, 20_000, 20_000) == 0.0
+        assert intrinsic_scale_at(1.0, 0.0, 30_000, 20_000) == 0.0  # clamped past the budget
+
+    def test_rising_schedule(self):
+        assert intrinsic_scale_at(0.0, 1.0, 0, 20_000) == 0.0
+        assert intrinsic_scale_at(0.0, 1.0, 10_000, 20_000) == 0.5
+        assert intrinsic_scale_at(0.0, 1.0, 20_000, 20_000) == 1.0
+
+    def test_zero_total_env_steps_does_not_divide_by_zero(self):
+        assert intrinsic_scale_at(1.0, 0.0, 0, 0) == 1.0  # max(1, ...) guard: env_steps 0 / 1 = frac 0
+
+
 class TestTrainer:
     def _trainer_with_data(self, **overrides) -> Trainer:
         overrides.setdefault("output_dir", "/tmp/thumper-test-runs")
@@ -209,6 +230,49 @@ class TestTrainer:
         assert changed("policy")
         assert changed("critic.")
         assert not changed("critic_target")
+
+    def test_policy_train_step_uses_scheduled_scale(self, monkeypatch):
+        """tickets/0012: the actor's intrinsic_scale is recomputed from
+        env_steps/total_env_steps each policy_train_step, not read as the
+        constant config value -- and the None default reproduces the
+        constant exactly."""
+        captured_cfgs = []
+        real_actor_critic_losses = trainer_module.actor_critic_losses
+
+        def recording_actor_critic_losses(*args, **kwargs):
+            captured_cfgs.append(kwargs.get("cfg") if "cfg" in kwargs else args[-1])
+            return real_actor_critic_losses(*args, **kwargs)
+
+        monkeypatch.setattr(trainer_module, "actor_critic_losses", recording_actor_critic_losses)
+
+        trainer = self._trainer_with_data(intrinsic_scale=1.0, intrinsic_scale_final=0.0, total_env_steps=1000)
+
+        trainer.env_steps = 0
+        metrics = trainer.train_step()
+        assert captured_cfgs[-1].intrinsic_scale == 1.0
+        assert metrics["intrinsic_scale_effective"] == 1.0
+
+        trainer.env_steps = trainer.config.total_env_steps
+        trainer.train_step()
+        assert captured_cfgs[-1].intrinsic_scale == 0.0
+
+    def test_policy_train_step_default_off_uses_constant_scale(self, monkeypatch):
+        captured_cfgs = []
+        real_actor_critic_losses = trainer_module.actor_critic_losses
+
+        def recording_actor_critic_losses(*args, **kwargs):
+            captured_cfgs.append(kwargs.get("cfg") if "cfg" in kwargs else args[-1])
+            return real_actor_critic_losses(*args, **kwargs)
+
+        monkeypatch.setattr(trainer_module, "actor_critic_losses", recording_actor_critic_losses)
+
+        trainer = self._trainer_with_data(intrinsic_scale=0.7, total_env_steps=1000)
+        assert trainer.config.intrinsic_scale_final is None
+
+        for env_steps in (0, 500, 1000, 5000):
+            trainer.env_steps = env_steps
+            trainer.train_step()
+            assert captured_cfgs[-1].intrinsic_scale == 0.7
 
     def test_kl_warmup_ramps_weight(self):
         trainer = self._trainer_with_data(kl_warmup_steps=10)
